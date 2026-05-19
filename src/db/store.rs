@@ -2,7 +2,7 @@ use crate::ai::schema::{AnalysisResult, SceneSummary};
 use crate::core::video_manager::VideoMeta;
 use crate::db::schema::INIT_SQL;
 use anyhow::Result;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -59,6 +59,18 @@ impl Database {
         )?;
         self.refresh_fts_row(video_id, &result.title, &result.summary, &tags_text, &scenes_text)?;
         Ok(())
+    }
+
+    pub fn get_summary_by_hash(&self, video_hash: &str) -> Result<Option<AnalysisResult>> {
+        let json: Option<String> = self.conn.query_row(
+            r#"SELECT s.structured_json
+               FROM video_summaries s
+               JOIN videos v ON v.id = s.video_id
+               WHERE v.hash = ?1"#,
+            params![video_hash],
+            |row| row.get(0),
+        ).optional()?;
+        if let Some(value) = json { Ok(Some(serde_json::from_str(&value)?)) } else { Ok(None) }
     }
 
     fn refresh_fts_row(&self, video_id: i64, title: &str, summary: &str, tags: &str, scenes_text: &str) -> Result<()> {
