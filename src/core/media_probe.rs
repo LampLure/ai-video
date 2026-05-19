@@ -1,6 +1,6 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProbeInfo {
@@ -19,16 +19,18 @@ pub fn probe_video(path: &str) -> Result<ProbeInfo> {
             "-of", "json",
             path,
         ])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
         .output();
 
     let Ok(output) = output else {
         return Ok(ProbeInfo::default());
     };
-    if !output.status.success() {
+    if !output.status.success() || output.stdout.is_empty() {
         return Ok(ProbeInfo::default());
     }
 
-    let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_default();
     let duration = value["format"]["duration"]
         .as_str()
         .and_then(|v| v.parse::<f64>().ok())
