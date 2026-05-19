@@ -28,15 +28,18 @@ pub fn scan_videos(dir: &str) -> Result<Vec<VideoMeta>> {
         if !entry.file_type().is_file() || !is_video_path(path) {
             continue;
         }
-        videos.push(read_video_meta(path)?);
+        videos.push(read_video_meta_fast(path)?);
     }
     videos.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(videos)
 }
 
 pub fn read_video_meta(path: &Path) -> Result<VideoMeta> {
+    read_video_meta_with_probe(path)
+}
+
+pub fn read_video_meta_fast(path: &Path) -> Result<VideoMeta> {
     let meta = fs::metadata(path)?;
-    let probe = probe_video(&path.to_string_lossy())?;
     let mtime = meta.modified().ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs() as i64)
@@ -45,13 +48,30 @@ pub fn read_video_meta(path: &Path) -> Result<VideoMeta> {
         path: path.to_string_lossy().to_string(),
         name: path.file_name().unwrap_or_default().to_string_lossy().to_string(),
         hash: stable_video_hash(path, meta.len(), mtime),
-        duration: probe.duration,
-        width: probe.width,
-        height: probe.height,
-        fps: probe.fps,
+        duration: 0.0,
+        width: 0,
+        height: 0,
+        fps: 0.0,
         size: meta.len(),
         mtime,
     })
+}
+
+pub fn read_video_meta_with_probe(path: &Path) -> Result<VideoMeta> {
+    let mut video = read_video_meta_fast(path)?;
+    let probe = probe_video(&path.to_string_lossy())?;
+    video.duration = probe.duration;
+    video.width = probe.width;
+    video.height = probe.height;
+    video.fps = probe.fps;
+    Ok(video)
+}
+
+pub fn hydrate_video_meta(video: &VideoMeta) -> Result<VideoMeta> {
+    if video.duration > 0.0 && video.width > 0 && video.height > 0 {
+        return Ok(video.clone());
+    }
+    read_video_meta_with_probe(Path::new(&video.path))
 }
 
 pub fn is_video_path(path: &Path) -> bool {
