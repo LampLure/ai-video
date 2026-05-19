@@ -1,4 +1,4 @@
-use crate::ai::schema::AnalysisResult;
+use crate::ai::schema::{AnalysisResult, SceneSummary};
 use crate::core::video_manager::VideoMeta;
 use crate::db::schema::INIT_SQL;
 use anyhow::Result;
@@ -44,32 +44,48 @@ impl Database {
     }
 
     pub fn save_summary(&self, video_id: i64, result: &AnalysisResult, model_name: &str) -> Result<()> {
-        let json = serde_json::to_string(result)?;
+        let structured_json = serde_json::to_string(result)?;
+        let tags_text = result.tags.join(" ");
+        let scenes_text = scenes_to_text(&result.scenes);
         self.conn.execute(
-            r#"INSERT INTO video_summaries(video_id, title, summary, structured_json, model_name)
-               VALUES (?1, ?2, ?3, ?4, ?5)
+            r#"INSERT INTO video_summaries(video_id, title, summary, tags_text, scenes_text, structured_json, model_name)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                ON CONFLICT(video_id) DO UPDATE SET
                  title=excluded.title, summary=excluded.summary,
+                 tags_text=excluded.tags_text, scenes_text=excluded.scenes_text,
                  structured_json=excluded.structured_json, model_name=excluded.model_name,
                  generated_at=CURRENT_TIMESTAMP"#,
-            params![video_id, result.title, result.summary, json, model_name],
+            params![video_id, result.title, result.summary, tags_text, scenes_text, structured_json, model_name],
+        )?;
+        self.refresh_fts_row(video_id, &result.title, &result.summary, &tags_text, &scenes_text)?;
+        Ok(())
+    }
+
+    fn refresh_fts_row(&self, video_id: i64, title: &str, summary: &str, tags: &str, scenes_text: &str) -> Result<()> {
+        self.conn.execute("DELETE FROM video_search_fts WHERE video_id = ?1", params![video_id])?;
+        self.conn.execute(
+            "INSERT INTO video_search_fts(video_id, title, summary, tags, scenes_text) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![video_id, title, summary, tags, scenes_text],
         )?;
         Ok(())
     }
 
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
-        if query.trim().is_empty() {
+        let trimmed = query.trim();
+        if trimmed.is_empty() {
             return self.latest(limit);
         }
+        let fts_query = make_fts_query(trimmed);
         let mut stmt = self.conn.prepare(
             r#"SELECT v.id, v.path, v.name, s.title, s.summary
                FROM video_search_fts f
                JOIN videos v ON v.id = f.video_id
                LEFT JOIN video_summaries s ON s.video_id = v.id
                WHERE video_search_fts MATCH ?1
+               ORDER BY rank
                LIMIT ?2"#,
         )?;
-        let rows = stmt.query_map(params![query, limit as i64], |row| {
+        let rows = stmt.query_map(params![fts_query, limit as i64], |row| {
             Ok(SearchResult {
                 video_id: row.get(0)?, path: row.get(1)?, name: row.get(2)?, title: row.get(3)?, summary: row.get(4)?,
             })
@@ -90,4 +106,21 @@ impl Database {
         })?;
         Ok(rows.filter_map(|row| row.ok()).collect())
     }
+}
+
+fn scenes_to_text(scenes: &[SceneSummary]) -> String {
+    scenes
+        .iter()
+        .map(|scene| format!("{:.3}-{:.3} {} {}", scene.start, scene.end, scene.description, scene.tags.join(" ")))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn make_fts_query(query: &str) -> String {
+    query
+        .split_whitespace()
+        .filter(|token| !token.trim().is_empty())
+        .map(|token| format!("\"{}\"", token.replace('"', "")))
+        .collect::<Vec<_>>()
+        .join(" OR ")
 }
