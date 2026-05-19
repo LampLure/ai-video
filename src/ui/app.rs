@@ -422,7 +422,8 @@ impl AiVideoApp {
                     self.playback_last_tick = None;
                 }
                 let duration = video.duration.max(0.1);
-                let slider = egui::Slider::new(&mut self.playback_position, 0.0..=duration).show_value(false).text(format!("{} / {}", format_duration(self.playback_position), format_duration(video.duration)));
+                let pos_label = format!("{} / {}", format_duration(self.playback_position), format_duration(video.duration));
+                let slider = egui::Slider::new(&mut self.playback_position, 0.0..=duration).show_value(false).text(pos_label);
                 if ui.add(slider).changed() {
                     self.playback_last_tick = Some(Instant::now());
                 }
@@ -494,7 +495,9 @@ impl AiVideoApp {
     }
 
     fn paint_playback_frame(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, video: &VideoMeta, rect: egui::Rect) {
-        if let Some(texture) = self.ensure_playback_frame(ctx, video).or_else(|| self.ensure_thumbnail(ctx, video)) {
+        let frame_texture = self.ensure_playback_frame(ctx, video);
+        let fallback_texture = if frame_texture.is_some() { None } else { self.ensure_thumbnail(ctx, video) };
+        if let Some(texture) = frame_texture.or(fallback_texture) {
             ui.painter().image(texture.id(), rect, egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
         } else {
             ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "视频播放预览区", egui::TextStyle::Heading.resolve(ui.style()), egui::Color32::from_gray(210));
