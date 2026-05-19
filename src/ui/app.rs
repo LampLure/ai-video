@@ -4,6 +4,7 @@ use crate::db::{Database, SearchResult};
 use eframe::egui;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ScreenMode {
@@ -38,6 +39,11 @@ pub struct AiVideoApp {
     ai_paused: bool,
     thumbnails: HashMap<String, egui::TextureHandle>,
     thumbnail_errors: HashMap<String, String>,
+    playback_position: f64,
+    playback_playing: bool,
+    playback_last_tick: Option<Instant>,
+    playback_frames: HashMap<String, egui::TextureHandle>,
+    playback_frame_errors: HashMap<String, String>,
 }
 
 impl Default for AiVideoApp {
@@ -59,6 +65,11 @@ impl Default for AiVideoApp {
             ai_paused: false,
             thumbnails: HashMap::new(),
             thumbnail_errors: HashMap::new(),
+            playback_position: 0.0,
+            playback_playing: false,
+            playback_last_tick: None,
+            playback_frames: HashMap::new(),
+            playback_frame_errors: HashMap::new(),
         }
     }
 }
@@ -66,6 +77,7 @@ impl Default for AiVideoApp {
 impl eframe::App for AiVideoApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         apply_gray_theme(ctx);
+        self.tick_playback(ctx);
 
         egui::TopBottomPanel::top("top_bar")
             .frame(panel_frame())
@@ -151,13 +163,13 @@ impl AiVideoApp {
         }
         if nav_button(ui, "进入播放").clicked() {
             if self.selected_index.is_none() && !self.videos.is_empty() {
-                self.selected_index = Some(0);
+                self.select_video(0);
             }
             self.mode = ScreenMode::Playback;
         }
         if nav_button(ui, "AI 分析").clicked() {
             if self.selected_index.is_none() && !self.videos.is_empty() {
-                self.selected_index = Some(0);
+                self.select_video(0);
             }
             self.mode = ScreenMode::AiAnalysis;
             self.chat_log.push("系统：已切换到 AI 分析模式。".to_string());
@@ -204,7 +216,8 @@ impl AiVideoApp {
             return;
         }
 
-        let card_width = 310.0;
+        let card_width = 260.0;
+        let card_height = 245.0;
         let spacing = 16.0;
         let cols = ((ui.available_width() + spacing) / (card_width + spacing)).floor().max(1.0) as usize;
         let indices = self.filtered_video_indices();
@@ -212,7 +225,7 @@ impl AiVideoApp {
             for row in indices.chunks(cols) {
                 ui.horizontal_top(|ui| {
                     for &idx in row {
-                        self.overview_video_card(ui, ctx, idx, card_width);
+                        self.overview_video_card(ui, ctx, idx, egui::vec2(card_width, card_height));
                         ui.add_space(spacing);
                     }
                 });
@@ -221,26 +234,24 @@ impl AiVideoApp {
         });
     }
 
-    fn overview_video_card(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, idx: usize, width: f32) {
+    fn overview_video_card(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, idx: usize, size: egui::Vec2) {
         let selected = self.selected_index == Some(idx);
         let video = self.videos[idx].clone();
+        let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
         let fill = if selected { egui::Color32::from_gray(44) } else { egui::Color32::from_gray(26) };
-        let response = egui::Frame::group(ui.style())
-            .fill(fill)
-            .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(if selected { 95 } else { 42 })))
-            .show(ui, |ui| {
-                ui.vertical_centered(|ui| {
-                    ui.set_width(width);
-                    let thumb_size = egui::vec2(width - 20.0, 170.0);
-                    self.thumbnail_ui(ui, ctx, &video, thumb_size);
-                    ui.add_space(8.0);
-                    ui.label(egui::RichText::new(&video.name).strong());
-                    ui.small(format_duration(video.duration));
-                });
-            })
-            .response;
+        ui.painter().rect_filled(rect, 6.0, fill);
+        ui.painter().rect_stroke(rect, 6.0, egui::Stroke::new(1.0, egui::Color32::from_gray(if selected { 95 } else { 42 })), egui::StrokeKind::Outside);
+
+        let thumb_rect = egui::Rect::from_min_size(rect.min + egui::vec2(10.0, 10.0), egui::vec2(size.x - 20.0, 170.0));
+        self.paint_thumbnail(ui, ctx, &video, thumb_rect);
+
+        let title_pos = egui::pos2(rect.center().x, thumb_rect.max.y + 20.0);
+        ui.painter().text(title_pos, egui::Align2::CENTER_CENTER, &video.name, egui::TextStyle::Button.resolve(ui.style()), egui::Color32::from_gray(235));
+        let duration_pos = egui::pos2(rect.center().x, thumb_rect.max.y + 42.0);
+        ui.painter().text(duration_pos, egui::Align2::CENTER_CENTER, format_duration(video.duration), egui::TextStyle::Small.resolve(ui.style()), egui::Color32::from_gray(165));
+
         if response.clicked() {
-            self.selected_index = Some(idx);
+            self.select_video(idx);
             self.mode = ScreenMode::Playback;
         }
     }
@@ -393,18 +404,29 @@ impl AiVideoApp {
         if let Some(video) = self.current_video().cloned() {
             let available_width = ui.available_width().max(320.0);
             let preview_height = (available_width * 9.0 / 16.0).clamp(260.0, 560.0);
-            let size = egui::vec2(available_width, preview_height);
-            egui::Frame::default()
-                .fill(egui::Color32::BLACK)
-                .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(70)))
-                .rounding(8.0)
-                .show(ui, |ui| {
-                    ui.set_min_size(size);
-                    ui.vertical_centered(|ui| {
-                        self.thumbnail_ui(ui, ctx, &video, size);
-                    });
-                });
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(available_width, preview_height), egui::Sense::hover());
+            ui.painter().rect_filled(rect, 8.0, egui::Color32::BLACK);
+            ui.painter().rect_stroke(rect, 8.0, egui::Stroke::new(1.0, egui::Color32::from_gray(70)), egui::StrokeKind::Outside);
+            self.paint_playback_frame(ui, ctx, &video, rect.shrink(8.0));
+
             ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                let button_text = if self.playback_playing { "暂停" } else { "播放" };
+                if ui.button(button_text).clicked() {
+                    self.playback_playing = !self.playback_playing;
+                    self.playback_last_tick = Some(Instant::now());
+                }
+                if ui.button("停止").clicked() {
+                    self.playback_playing = false;
+                    self.playback_position = 0.0;
+                    self.playback_last_tick = None;
+                }
+                let duration = video.duration.max(0.1);
+                let slider = egui::Slider::new(&mut self.playback_position, 0.0..=duration).show_value(false).text(format!("{} / {}", format_duration(self.playback_position), format_duration(video.duration)));
+                if ui.add(slider).changed() {
+                    self.playback_last_tick = Some(Instant::now());
+                }
+            });
             ui.heading(&video.name);
             ui.label(format_duration(video.duration));
         } else {
@@ -415,38 +437,67 @@ impl AiVideoApp {
     fn side_video_card(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, idx: usize) {
         let selected = self.selected_index == Some(idx);
         let video = self.videos[idx].clone();
-        let response = egui::Frame::group(ui.style())
-            .fill(if selected { egui::Color32::from_gray(58) } else { egui::Color32::from_gray(32) })
-            .show(ui, |ui| {
-                ui.vertical_centered(|ui| {
-                    let width = ui.available_width().max(120.0);
-                    self.thumbnail_ui(ui, ctx, &video, egui::vec2(width, 76.0));
-                    ui.label(egui::RichText::new(&video.name).small());
-                    ui.small(format_duration(video.duration));
-                });
-            })
-            .response;
-        if response.clicked() { self.selected_index = Some(idx); }
+        let size = egui::vec2(ui.available_width().max(120.0), 130.0);
+        let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+        ui.painter().rect_filled(rect, 5.0, if selected { egui::Color32::from_gray(58) } else { egui::Color32::from_gray(32) });
+        ui.painter().rect_stroke(rect, 5.0, egui::Stroke::new(1.0, egui::Color32::from_gray(if selected { 100 } else { 45 })), egui::StrokeKind::Outside);
+        let thumb_rect = egui::Rect::from_min_size(rect.min + egui::vec2(8.0, 8.0), egui::vec2(size.x - 16.0, 76.0));
+        self.paint_thumbnail(ui, ctx, &video, thumb_rect);
+        ui.painter().text(egui::pos2(rect.center().x, thumb_rect.max.y + 18.0), egui::Align2::CENTER_CENTER, &video.name, egui::TextStyle::Small.resolve(ui.style()), egui::Color32::from_gray(230));
+        ui.painter().text(egui::pos2(rect.center().x, thumb_rect.max.y + 36.0), egui::Align2::CENTER_CENTER, format_duration(video.duration), egui::TextStyle::Small.resolve(ui.style()), egui::Color32::from_gray(165));
+        if response.clicked() {
+            self.select_video(idx);
+        }
         ui.add_space(6.0);
     }
 
-    fn thumbnail_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, video: &VideoMeta, size: egui::Vec2) {
+    fn ensure_thumbnail(&mut self, ctx: &egui::Context, video: &VideoMeta) -> Option<egui::TextureHandle> {
         let key = video.hash.clone();
         if !self.thumbnails.contains_key(&key) && !self.thumbnail_errors.contains_key(&key) {
             match crate::core::cache_manager::extract_thumbnail(&video.path, &video.hash, 0.0) {
-                Ok(path) => match load_texture_from_path(ctx, &path, &key) {
+                Ok(path) => match load_texture_from_path(ctx, &path, &format!("thumb_{key}")) {
                     Ok(texture) => { self.thumbnails.insert(key.clone(), texture); }
                     Err(err) => { self.thumbnail_errors.insert(key.clone(), err); }
                 },
                 Err(err) => { self.thumbnail_errors.insert(key.clone(), err.to_string()); }
             }
         }
-        if let Some(texture) = self.thumbnails.get(&key) {
-            ui.add(egui::Image::new(texture).fit_to_exact_size(size));
+        self.thumbnails.get(&key).cloned()
+    }
+
+    fn ensure_playback_frame(&mut self, ctx: &egui::Context, video: &VideoMeta) -> Option<egui::TextureHandle> {
+        let frame_second = self.playback_position.floor().max(0.0);
+        let key = format!("{}_{:.0}", video.hash, frame_second);
+        if !self.playback_frames.contains_key(&key) && !self.playback_frame_errors.contains_key(&key) {
+            match crate::core::cache_manager::extract_frames(&video.path, &video.hash, &[frame_second], self.settings.image_pixel_limit) {
+                Ok(paths) => {
+                    if let Some(path) = paths.first() {
+                        match load_texture_from_path(ctx, path, &format!("frame_{key}")) {
+                            Ok(texture) => { self.playback_frames.insert(key.clone(), texture); }
+                            Err(err) => { self.playback_frame_errors.insert(key.clone(), err); }
+                        }
+                    }
+                }
+                Err(err) => { self.playback_frame_errors.insert(key.clone(), err.to_string()); }
+            }
+        }
+        self.playback_frames.get(&key).cloned()
+    }
+
+    fn paint_thumbnail(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, video: &VideoMeta, rect: egui::Rect) {
+        if let Some(texture) = self.ensure_thumbnail(ctx, video) {
+            ui.painter().image(texture.id(), rect, egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
         } else {
-            let (rect, _) = ui.allocate_exact_size(size, egui::Sense::click());
             ui.painter().rect_filled(rect, 4.0, egui::Color32::BLACK);
             ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "缩略图", egui::TextStyle::Small.resolve(ui.style()), egui::Color32::from_gray(170));
+        }
+    }
+
+    fn paint_playback_frame(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, video: &VideoMeta, rect: egui::Rect) {
+        if let Some(texture) = self.ensure_playback_frame(ctx, video).or_else(|| self.ensure_thumbnail(ctx, video)) {
+            ui.painter().image(texture.id(), rect, egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
+        } else {
+            ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "视频播放预览区", egui::TextStyle::Heading.resolve(ui.style()), egui::Color32::from_gray(210));
         }
     }
 
@@ -461,14 +512,49 @@ impl AiVideoApp {
         }).collect()
     }
 
+    fn select_video(&mut self, idx: usize) {
+        if self.selected_index != Some(idx) {
+            self.selected_index = Some(idx);
+            self.playback_position = 0.0;
+            self.playback_playing = false;
+            self.playback_last_tick = None;
+        } else {
+            self.selected_index = Some(idx);
+        }
+    }
+
+    fn tick_playback(&mut self, ctx: &egui::Context) {
+        if !self.playback_playing {
+            self.playback_last_tick = None;
+            return;
+        }
+        let now = Instant::now();
+        if let Some(last) = self.playback_last_tick {
+            let delta = now.saturating_duration_since(last).as_secs_f64();
+            self.playback_position += delta;
+        }
+        self.playback_last_tick = Some(now);
+        if let Some(video) = self.current_video() {
+            if video.duration > 0.0 && self.playback_position >= video.duration {
+                self.playback_position = video.duration;
+                self.playback_playing = false;
+            }
+        }
+        ctx.request_repaint_after(Duration::from_millis(200));
+    }
+
     fn scan_folder(&mut self, folder: PathBuf) {
         self.scan_status = format!("正在扫描：{}", folder.display());
         self.thumbnails.clear();
         self.thumbnail_errors.clear();
+        self.playback_frames.clear();
+        self.playback_frame_errors.clear();
         match scan_videos(&folder.to_string_lossy()) {
             Ok(videos) => {
                 self.videos = videos;
                 self.selected_index = None;
+                self.playback_position = 0.0;
+                self.playback_playing = false;
                 self.scan_status = format!("扫描完成：{} 个视频", self.videos.len());
                 self.persist_scanned_videos();
             }
@@ -498,7 +584,7 @@ fn load_texture_from_path(ctx: &egui::Context, path: &str, key: &str) -> Result<
     let size = [image.width() as usize, image.height() as usize];
     let pixels = image.into_raw();
     let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
-    Ok(ctx.load_texture(format!("thumb_{key}"), color_image, egui::TextureOptions::LINEAR))
+    Ok(ctx.load_texture(key.to_string(), color_image, egui::TextureOptions::LINEAR))
 }
 
 fn format_duration(seconds: f64) -> String {
