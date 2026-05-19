@@ -1,3 +1,4 @@
+use crate::ai::prompts;
 use crate::core::settings::AppSettings;
 use crate::core::video_manager::{scan_videos, VideoMeta};
 use crate::db::{Database, SearchResult};
@@ -12,7 +13,7 @@ use std::time::{Duration, Instant};
 enum ScreenMode { Overview, Playback, AiAnalysis, Settings }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SettingsSection { Model, AiLimits, Media, Cache, Debug }
+enum SettingsSection { Model, Prompts, AiLimits, Media, Cache, Debug }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ModelCheckKind { Start, Stop }
@@ -57,6 +58,7 @@ impl Default for AiVideoApp {
     fn default() -> Self {
         let scripts = models::list_model_scripts();
         let selected = scripts.first().cloned();
+        let _ = prompts::ensure_prompt_files();
         Self {
             mode: ScreenMode::Overview,
             settings_section: SettingsSection::Model,
@@ -162,15 +164,12 @@ impl AiVideoApp {
             }
         }
         if nav_button(ui, "分析文件/生成缩略图").clicked() { self.generate_visible_thumbnails(); }
-
         egui::Frame::group(ui.style()).show(ui, |ui| self.model_panel(ui));
-
         ui.add_space(8.0);
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.label(egui::RichText::new("当前目录").strong());
             ui.small(elide_middle(&self.folder.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "未选择".to_string()), 32));
         });
-
         ui.add_space(8.0);
         if nav_button(ui, "媒体总览").clicked() {
             self.mode = ScreenMode::Overview;
@@ -185,8 +184,7 @@ impl AiVideoApp {
             if self.mode == ScreenMode::AiAnalysis {
                 self.mode = ScreenMode::Overview;
                 self.bottom_panel_height = self.bottom_panel_height.min(120.0).max(64.0);
-            }
-            else {
+            } else {
                 if self.selected_index.is_none() && !self.videos.is_empty() { self.select_video(0); }
                 self.mode = ScreenMode::AiAnalysis;
                 if self.bottom_panel_height < 180.0 { self.bottom_panel_height = 240.0; }
@@ -194,7 +192,6 @@ impl AiVideoApp {
             }
         }
         if nav_button(ui, "设置").clicked() { self.mode = ScreenMode::Settings; }
-
         ui.add_space(10.0);
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.label(egui::RichText::new("目录信息").strong());
@@ -260,7 +257,6 @@ impl AiVideoApp {
             ui.centered_and_justified(|ui| ui.label("点击左侧“选择文件夹”后，视频会以卡片网格排列在这里。点击某个视频进入播放界面。"));
             return;
         }
-
         let card_width = 260.0;
         let card_height = 245.0;
         let spacing = 16.0;
@@ -352,6 +348,7 @@ impl AiVideoApp {
                 ui.set_width(190.0);
                 ui.label(egui::RichText::new("设置导航").strong());
                 self.settings_nav_button(ui, SettingsSection::Model, "模型启动");
+                self.settings_nav_button(ui, SettingsSection::Prompts, "提示词/Agent");
                 self.settings_nav_button(ui, SettingsSection::AiLimits, "AI 限制");
                 self.settings_nav_button(ui, SettingsSection::Media, "媒体处理");
                 self.settings_nav_button(ui, SettingsSection::Cache, "缓存策略");
@@ -362,6 +359,7 @@ impl AiVideoApp {
                 ui.set_width(ui.available_width());
                 match self.settings_section {
                     SettingsSection::Model => self.settings_model(ui),
+                    SettingsSection::Prompts => self.settings_prompts(ui),
                     SettingsSection::AiLimits => self.settings_ai_limits(ui),
                     SettingsSection::Media => self.settings_media(ui),
                     SettingsSection::Cache => self.settings_cache(ui),
@@ -378,6 +376,17 @@ impl AiVideoApp {
         setting_text(ui, "模型名", &mut self.settings.model_name);
         ui.add_space(8.0);
         self.model_panel(ui);
+    }
+
+    fn settings_prompts(&mut self, ui: &mut egui::Ui) {
+        ui.heading("提示词 / Skill / Agent");
+        ui.label(format!("提示词目录：{}", prompts::ensure_prompt_files().display()));
+        ui.add_space(8.0);
+        prompt_button(ui, "修改视频简介生成提示词", prompts::VIDEO_ANALYSIS_PROMPT, self);
+        prompt_button(ui, "修改当前视频问答 Agent 限制文本", prompts::VIDEO_QA_AGENT_PROMPT, self);
+        prompt_button(ui, "修改 AI 简介 JSON 输出格式", prompts::RESPONSE_SCHEMA_PROMPT, self);
+        ui.add_space(8.0);
+        ui.label("修改并保存文档后，后续 AI 分析会读取新的提示词。已在运行中的单次请求不会被中途替换。 ");
     }
 
     fn settings_ai_limits(&mut self, ui: &mut egui::Ui) {
@@ -784,6 +793,18 @@ impl Drop for AiVideoApp {
     fn drop(&mut self) {
         if let Some(mut child) = self.model_child.take() { models::stop_model_process(&mut child); }
     }
+}
+
+fn prompt_button(ui: &mut egui::Ui, label: &str, file_name: &str, app: &mut AiVideoApp) {
+    ui.horizontal(|ui| {
+        if ui.button(label).clicked() {
+            match prompts::open_prompt_file(file_name) {
+                Ok(()) => app.show_notice("已打开提示词文档", format!("已打开：{}", prompts::prompt_path(file_name).display())),
+                Err(err) => app.show_notice("打开失败", err),
+            }
+        }
+        ui.small(elide_middle(&prompts::prompt_path(file_name).display().to_string(), 60));
+    });
 }
 
 fn load_texture_from_path(ctx: &egui::Context, path: &str, key: &str) -> Result<egui::TextureHandle, String> {
