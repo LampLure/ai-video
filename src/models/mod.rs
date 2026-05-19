@@ -83,6 +83,29 @@ pub fn stop_model_process(child: &mut Child) {
     let _ = child.wait();
 }
 
+pub fn kill_7080_processes() -> Result<(), String> {
+    let status = if cfg!(windows) {
+        Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-ExecutionPolicy", "Bypass",
+                "-Command",
+                "Get-NetTCPConnection -LocalPort 7080 -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique | ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+    } else {
+        Command::new("sh")
+            .arg("-c")
+            .arg("pids=$( (lsof -ti tcp:7080 2>/dev/null; fuser 7080/tcp 2>/dev/null | tr ' ' '\n') | sort -u); if [ -n \"$pids\" ]; then kill -9 $pids 2>/dev/null || true; fi")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+    };
+    status.map(|_| ()).map_err(|err| format!("杀死 7080 端口进程失败：{err}"))
+}
+
 pub fn llama_props_url() -> &'static str { "http://127.0.0.1:7080/props" }
 
 pub fn is_llama_service_ready(timeout: Duration) -> bool {
