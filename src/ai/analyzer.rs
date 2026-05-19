@@ -1,6 +1,7 @@
+use crate::ai::agent::{handle_agent_request, AgentRequest, AgentResponse, SegmentRequestLimits};
 use crate::ai::client::{AiClient, ChatMessage};
 use crate::ai::prompts::{read_prompt, RESPONSE_SCHEMA_PROMPT, VIDEO_ANALYSIS_PROMPT, VIDEO_QA_AGENT_PROMPT};
-use crate::ai::schema::{clean_model_output, response_schema_prompt, AnalysisResult};
+use crate::ai::schema::{clean_model_output, AnalysisResult};
 use crate::core::cache_manager::{extract_audio_segment, extract_frames};
 use crate::core::settings::AppSettings;
 use crate::core::video_manager::VideoMeta;
@@ -40,8 +41,59 @@ pub fn analyze_video(video: &VideoMeta, settings: &AppSettings, db_path: &Path) 
 
 pub fn ask_video_question(video: &VideoMeta, question: &str, settings: &AppSettings) -> Result<String> {
     let client = AiClient::new(settings.llama_cpp_endpoint.clone(), settings.model_name.clone());
-    let prompt = format!("{}\n\n# 当前视频\n视频名：{}\n视频路径：{}\n视频 hash：{}\n视频时长：{:.3}s\n最大图片数：{}\n最大音频段数：{}\n用户问题：{}", read_prompt(VIDEO_QA_AGENT_PROMPT), video.name, video.path, video.hash, video.duration, settings.max_images, settings.max_audio_segments, question);
-    client.chat(vec![ChatMessage { role: "user".to_string(), content: prompt }], 0.2)
+    let first_prompt = format!(
+        "{}\n\n# 当前视频\n视频名：{}\n视频路径：{}\n视频 hash：{}\n视频时长：{:.3}s\n最大图片数：{}\n最大音频段数：{}\n用户问题：{}",
+        read_prompt(VIDEO_QA_AGENT_PROMPT),
+        video.name,
+        video.path,
+        video.hash,
+        video.duration,
+        settings.max_images,
+        settings.max_audio_segments,
+        question
+    );
+    let first = client.chat(vec![ChatMessage { role: "user".to_string(), content: first_prompt.clone() }], 0.2)?;
+
+    if let Ok(request) = serde_json::from_str::<AgentRequest>(&clean_model_output(&first)) {
+        let limits = SegmentRequestLimits::from_settings(video.duration, settings);
+        let response = handle_agent_request(request, limits, settings)?;
+        match response {
+            AgentResponse::Ok { frames, audio } => {
+                let evidence_prompt = format!(
+                    "用户问题：{}\n\n程序已按你的 JSON 请求准备证据。请只根据这些证据和视频元数据回答。\n视频名：{}\n视频时长：{:.3}s\n图片文件：{}\n音频文件：{}\n\n请用中文简洁回答。如果证据不足，直接说明不足。",
+                    question,
+                    video.name,
+                    video.duration,
+                    frames.join(", "),
+                    audio.join(", ")
+                );
+                return client.chat(
+                    vec![
+                        ChatMessage { role: "user".to_string(), content: first_prompt },
+                        ChatMessage { role: "assistant".to_string(), content: first },
+                        ChatMessage { role: "user".to_string(), content: evidence_prompt },
+                    ],
+                    0.2,
+                );
+            }
+            AgentResponse::Error { code, message } => {
+                let repair_prompt = format!(
+                    "你的上一条片段请求被程序拒绝。错误代码：{}。错误信息：{}。请在限制范围内重新请求更少数据，或者直接说明无法回答。用户问题：{}",
+                    code, message, question
+                );
+                return client.chat(
+                    vec![
+                        ChatMessage { role: "user".to_string(), content: first_prompt },
+                        ChatMessage { role: "assistant".to_string(), content: first },
+                        ChatMessage { role: "user".to_string(), content: repair_prompt },
+                    ],
+                    0.2,
+                );
+            }
+        }
+    }
+
+    Ok(first)
 }
 
 pub fn parse_analysis_result(raw: &str) -> Result<AnalysisResult> {
