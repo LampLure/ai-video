@@ -15,6 +15,10 @@ pub enum QueueState {
     Finished,
 }
 
+impl Default for QueueState {
+    fn default() -> Self { Self::Idle }
+}
+
 #[derive(Debug, Default)]
 pub struct AnalysisQueue {
     jobs: VecDeque<AnalysisJob>,
