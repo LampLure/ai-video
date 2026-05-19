@@ -25,18 +25,18 @@ fn db_path() -> PathBuf {
 
 fn to_tauri_error(err: anyhow::Error) -> String { err.to_string() }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn get_default_settings() -> AppSettings {
     settings_cell().lock().map(|v| v.clone()).unwrap_or_default()
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn save_settings(settings: AppSettings) -> Result<AppSettings, String> {
     *settings_cell().lock().map_err(|e| e.to_string())? = settings.clone();
     Ok(settings)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn scan_videos(dir: String) -> Result<Vec<VideoMeta>, String> {
     let videos = scan_videos_inner(&dir).map_err(to_tauri_error)?;
     let db = Database::open(db_path()).map_err(to_tauri_error)?;
@@ -46,35 +46,36 @@ pub fn scan_videos(dir: String) -> Result<Vec<VideoMeta>, String> {
     Ok(videos)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn init_database() -> Result<String, String> {
     let path = db_path();
     Database::open(&path).map_err(to_tauri_error)?;
     Ok(path.to_string_lossy().to_string())
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn search_videos(query: String, limit: Option<usize>) -> Result<Vec<SearchResult>, String> {
     let db = Database::open(db_path()).map_err(to_tauri_error)?;
     db.search(&query, limit.unwrap_or(50)).map_err(to_tauri_error)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn start_analysis_queue(videos: Vec<VideoMeta>, start_index: usize) -> Result<QueueState, String> {
     let mut queue = AnalysisQueue::load_from(videos, start_index);
     queue.start();
+    let state = queue.state();
     *queue_cell().lock().map_err(|e| e.to_string())? = queue;
-    Ok(QueueState::Running)
+    Ok(state)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn pause_analysis_queue() -> Result<QueueState, String> {
     let mut queue = queue_cell().lock().map_err(|e| e.to_string())?;
     queue.pause();
     Ok(queue.state())
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn ask_current_video(question: String) -> Result<String, String> {
     let queue = queue_cell().lock().map_err(|e| e.to_string())?;
     if !queue.can_user_ask() {
@@ -84,7 +85,7 @@ pub fn ask_current_video(question: String) -> Result<String, String> {
     Ok(format!("已接收针对 {current} 的问题：{question}"))
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn prepare_video_segment(request: AgentRequest, duration: f64) -> Result<serde_json::Value, String> {
     let settings = settings_cell().lock().map_err(|e| e.to_string())?.clone();
     let limits = SegmentRequestLimits::from_settings(duration, &settings);
