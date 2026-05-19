@@ -144,13 +144,14 @@ impl AiVideoApp {
     fn ai_analysis_view(&mut self, ui: &mut egui::Ui) {
         ui.heading("AI 分析工作区");
         ui.separator();
-        if let Some(video) = self.current_video() {
-            ui.label(format!("当前视频：{}", video.name));
+        let current = self.current_video().map(|video| (video.name.clone(), video.duration));
+        if let Some((video_name, duration)) = current {
+            ui.label(format!("当前视频：{}", video_name));
             ui.label("队列策略：单线程顺序分析；后台分析时禁止用户提问；暂停后允许针对当前视频提问。");
             ui.add_space(8.0);
             if ui.button("模拟开始分析当前视频").clicked() {
-                self.chat_log.push(format!("系统：开始分析 {}", video.name));
-                self.chat_log.push(format!("AI：已接收视频总时长 {:.2}s 与最大图片/音频限制。", video.duration));
+                self.chat_log.push(format!("系统：开始分析 {}", video_name));
+                self.chat_log.push(format!("AI：已接收视频总时长 {:.2}s 与最大图片/音频限制。", duration));
             }
             if ui.button("暂停分析，允许提问").clicked() {
                 self.chat_log.push("系统：分析已暂停，现在允许用户针对当前视频提问。".to_string());
