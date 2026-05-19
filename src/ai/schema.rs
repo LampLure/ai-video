@@ -37,17 +37,8 @@ pub struct AnalysisResult {
     pub audio: AudioSummary,
 }
 
-pub fn response_schema_prompt() -> &'static str {
-    r#"You must output strict JSON only, with this schema:
-{
-  "title": "string",
-  "summary": "string",
-  "tags": ["string"],
-  "scenes": [{"start": 0.0, "end": 0.0, "description": "string", "tags": ["string"]}],
-  "quality": {},
-  "audio": {}
-}
-No markdown fences. No additional commentary."#
+pub fn response_schema_prompt() -> String {
+    crate::ai::prompts::read_prompt(crate::ai::prompts::RESPONSE_SCHEMA_PROMPT)
 }
 
 pub fn clean_model_output(raw: &str) -> String {
