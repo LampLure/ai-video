@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod analyzer;
 pub mod client;
+pub mod prompts;
 pub mod queue;
 pub mod schema;
 
