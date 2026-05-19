@@ -14,6 +14,12 @@ enum ScreenMode { Overview, Playback, AiAnalysis, Settings }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SettingsSection { Model, AiLimits, Media, Cache, Debug }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelCheckKind { Start, Stop }
+
+#[derive(Debug, Clone)]
+struct PendingModelCheck { due: Instant, kind: ModelCheckKind }
+
 pub struct AiVideoApp {
     mode: ScreenMode,
     settings_section: SettingsSection,
@@ -40,6 +46,10 @@ pub struct AiVideoApp {
     selected_model_script: Option<PathBuf>,
     model_child: Option<Child>,
     model_status: String,
+    pending_model_check: Option<PendingModelCheck>,
+    model_notice_open: bool,
+    model_notice_title: String,
+    model_notice_body: String,
 }
 
 impl Default for AiVideoApp {
@@ -72,6 +82,10 @@ impl Default for AiVideoApp {
             selected_model_script: selected,
             model_child: None,
             model_status: format!("模型目录：{}", models::ensure_models_dir().display()),
+            pending_model_check: None,
+            model_notice_open: false,
+            model_notice_title: String::new(),
+            model_notice_body: String::new(),
         }
     }
 }
@@ -81,12 +95,14 @@ impl eframe::App for AiVideoApp {
         apply_gray_theme(ctx);
         self.tick_playback(ctx);
         self.poll_model_process();
+        self.poll_model_health();
+        self.show_model_notice(ctx);
 
         egui::TopBottomPanel::top("top_bar").frame(panel_frame()).show(ctx, |ui| self.top_bar(ui));
         egui::SidePanel::left("control_panel")
             .resizable(true)
             .default_width(280.0)
-            .width_range(120.0..=650.0)
+            .width_range(96.0..=650.0)
             .frame(panel_frame())
             .show(ctx, |ui| self.left_control_panel(ui));
 
@@ -144,34 +160,14 @@ impl AiVideoApp {
                 self.mode = ScreenMode::Overview;
             }
         }
-        if nav_button(ui, "分析文件/生成缩略图").clicked() {
-            self.generate_visible_thumbnails();
-        }
+        if nav_button(ui, "分析文件/生成缩略图").clicked() { self.generate_visible_thumbnails(); }
 
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.label(egui::RichText::new("模型启动").strong());
-            ui.small(format!("放置目录：{}", models::ensure_models_dir().display()));
-            ui.horizontal(|ui| {
-                if ui.button("刷新").clicked() { self.refresh_model_scripts(); }
-                if ui.button("启动").clicked() { self.start_selected_model(); }
-                if ui.button("停止").clicked() { self.stop_model(); }
-            });
-            egui::ComboBox::from_id_salt("model_script_combo")
-                .selected_text(self.selected_model_script.as_ref().and_then(|p| p.file_name()).and_then(|s| s.to_str()).unwrap_or("未选择启动文件"))
-                .width(ui.available_width())
-                .show_ui(ui, |ui| {
-                    for path in self.model_scripts.clone() {
-                        let label = path.file_name().and_then(|s| s.to_str()).unwrap_or("unknown").to_string();
-                        ui.selectable_value(&mut self.selected_model_script, Some(path), label);
-                    }
-                });
-            ui.small(&self.model_status);
-        });
+        egui::Frame::group(ui.style()).show(ui, |ui| self.model_panel(ui));
 
         ui.add_space(8.0);
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.label(egui::RichText::new("当前目录").strong());
-            ui.small(self.folder.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "未选择".to_string()));
+            ui.small(elide_middle(&self.folder.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "未选择".to_string()), 32));
         });
 
         ui.add_space(8.0);
@@ -195,9 +191,38 @@ impl AiVideoApp {
             ui.label(egui::RichText::new("目录信息").strong());
             ui.label(format!("视频数：{}", self.videos.len()));
             if let Some(idx) = self.selected_index.and_then(|i| self.videos.get(i).map(|_| i)) {
-                ui.small(format!("当前：{}", self.videos[idx].name));
+                ui.small(elide_middle(&format!("当前：{}", self.videos[idx].name), 36));
             }
         });
+    }
+
+    fn model_panel(&mut self, ui: &mut egui::Ui) {
+        ui.label(egui::RichText::new("模型启动").strong());
+        ui.small(elide_middle(&format!("目录：{}", models::ensure_models_dir().display()), 34));
+        ui.horizontal(|ui| {
+            if ui.button("刷新").clicked() { self.refresh_model_scripts(); }
+            let can_start = self.model_child.is_none() && !self.has_pending_model_check(ModelCheckKind::Start);
+            if ui.add_enabled(can_start, egui::Button::new("启动")).clicked() { self.start_selected_model(); }
+            let can_stop = self.model_child.is_some();
+            if ui.add_enabled(can_stop, egui::Button::new("终止")).clicked() { self.stop_model(); }
+        });
+        let selected_text = self.selected_model_script
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .and_then(|s| s.to_str())
+            .map(|s| elide_middle(s, 22))
+            .unwrap_or_else(|| "未选择启动文件".to_string());
+        egui::ComboBox::from_id_salt("model_script_combo")
+            .selected_text(selected_text)
+            .width((ui.available_width() - 4.0).max(60.0))
+            .show_ui(ui, |ui| {
+                for path in self.model_scripts.clone() {
+                    let full = path.display().to_string();
+                    let label = path.file_name().and_then(|s| s.to_str()).map(|s| elide_middle(s, 40)).unwrap_or_else(|| "unknown".to_string());
+                    ui.selectable_value(&mut self.selected_model_script, Some(path), label).on_hover_text(full);
+                }
+            });
+        ui.small(elide_middle(&self.model_status, 42));
     }
 
     fn overview_grid(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -308,7 +333,7 @@ impl AiVideoApp {
         ui.separator();
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
-                ui.set_width(210.0);
+                ui.set_width(190.0);
                 ui.label(egui::RichText::new("设置导航").strong());
                 self.settings_nav_button(ui, SettingsSection::Model, "模型启动");
                 self.settings_nav_button(ui, SettingsSection::AiLimits, "AI 限制");
@@ -317,49 +342,53 @@ impl AiVideoApp {
                 self.settings_nav_button(ui, SettingsSection::Debug, "调试模式");
             });
             ui.separator();
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                ui.set_min_width(420.0);
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                ui.set_width(ui.available_width());
                 match self.settings_section {
-                    SettingsSection::Model => {
-                        ui.heading("模型启动");
-                        ui.label(format!("将 llama.cpp 启动脚本放到：{}", models::ensure_models_dir().display()));
-                        ui.horizontal(|ui| {
-                            ui.label("接口");
-                            ui.text_edit_singleline(&mut self.settings.llama_cpp_endpoint);
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("模型名");
-                            ui.text_edit_singleline(&mut self.settings.model_name);
-                        });
-                        if ui.button("刷新启动文件列表").clicked() { self.refresh_model_scripts(); }
-                        ui.label(&self.model_status);
-                    }
-                    SettingsSection::AiLimits => {
-                        ui.heading("AI 限制");
-                        ui.add(egui::Slider::new(&mut self.settings.max_images, 1..=64).text("第一次分析发送图片数 / 请求图片上限"));
-                        ui.add(egui::Slider::new(&mut self.settings.max_audio_segments, 0..=32).text("音频段数上限"));
-                        ui.add(egui::Slider::new(&mut self.settings.max_context_tokens, 1024..=65536).text("最大上下文 token 长度"));
-                    }
-                    SettingsSection::Media => {
-                        ui.heading("媒体处理");
-                        ui.add(egui::Slider::new(&mut self.settings.audio_clip_seconds, 1.0..=30.0).text("音频截取长度/s"));
-                        ui.add(egui::Slider::new(&mut self.settings.image_pixel_limit, 1000..=100000).text("图片压缩总像素上限"));
-                        ui.add(egui::Slider::new(&mut self.settings.audio_sample_rate, 8000..=48000).text("音频采样率"));
-                    }
-                    SettingsSection::Cache => {
-                        ui.heading("缓存策略");
-                        ui.add(egui::Slider::new(&mut self.settings.cache_size_limit_mb, 128..=65536).text("缓存大小上限 / MB"));
-                        ui.label("缓存目录结构：cache/thumbs、cache/frames、cache/audio");
-                        ui.label("后续将按大小清理最旧缓存。切换文件夹策略由 cache_switch_policy 控制。");
-                    }
-                    SettingsSection::Debug => {
-                        ui.heading("调试模式");
-                        ui.checkbox(&mut self.settings.debug_mode, "显示原始 JSON");
-                        ui.label("非调试模式下，聊天栏仅显示清洗后的文本。");
-                    }
+                    SettingsSection::Model => self.settings_model(ui),
+                    SettingsSection::AiLimits => self.settings_ai_limits(ui),
+                    SettingsSection::Media => self.settings_media(ui),
+                    SettingsSection::Cache => self.settings_cache(ui),
+                    SettingsSection::Debug => self.settings_debug(ui),
                 }
             });
         });
+    }
+
+    fn settings_model(&mut self, ui: &mut egui::Ui) {
+        ui.heading("模型启动");
+        ui.label(format!("将 llama.cpp 启动脚本放到：{}", models::ensure_models_dir().display()));
+        setting_text(ui, "接口", &mut self.settings.llama_cpp_endpoint);
+        setting_text(ui, "模型名", &mut self.settings.model_name);
+        ui.add_space(8.0);
+        self.model_panel(ui);
+    }
+
+    fn settings_ai_limits(&mut self, ui: &mut egui::Ui) {
+        ui.heading("AI 限制");
+        setting_slider_usize(ui, "第一次分析发送图片数 / 请求图片上限", &mut self.settings.max_images, 1..=64);
+        setting_slider_usize(ui, "音频段数上限", &mut self.settings.max_audio_segments, 0..=32);
+        setting_slider_usize(ui, "最大上下文 token 长度", &mut self.settings.max_context_tokens, 1024..=65536);
+    }
+
+    fn settings_media(&mut self, ui: &mut egui::Ui) {
+        ui.heading("媒体处理");
+        setting_slider_f32(ui, "音频截取长度/s", &mut self.settings.audio_clip_seconds, 1.0..=30.0);
+        setting_slider_u32(ui, "图片压缩总像素上限", &mut self.settings.image_pixel_limit, 1000..=100000);
+        setting_slider_u32(ui, "音频采样率", &mut self.settings.audio_sample_rate, 8000..=48000);
+    }
+
+    fn settings_cache(&mut self, ui: &mut egui::Ui) {
+        ui.heading("缓存策略");
+        setting_slider_u64(ui, "缓存大小上限 / MB", &mut self.settings.cache_size_limit_mb, 128..=65536);
+        ui.label("缓存目录结构：cache/thumbs、cache/frames、cache/audio");
+        ui.label("后续将按大小清理最旧缓存。切换文件夹策略由 cache_switch_policy 控制。");
+    }
+
+    fn settings_debug(&mut self, ui: &mut egui::Ui) {
+        ui.heading("调试模式");
+        ui.checkbox(&mut self.settings.debug_mode, "显示原始 JSON");
+        ui.label("非调试模式下，聊天栏仅显示清洗后的文本。");
     }
 
     fn right_ai_video_list(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -455,10 +484,10 @@ impl AiVideoApp {
             egui::Frame::group(ui.style()).show(ui, |ui| {
                 ui.label(egui::RichText::new("AI 简介").strong());
                 match Database::open(&self.db_path).and_then(|db| db.get_summary_by_hash(&video.hash)) {
-                    Ok(Some(summary)) => ui.label(crate::ai::render_analysis_text(&summary)),
-                    Ok(None) => ui.label("当前视频尚未生成简介。"),
-                    Err(err) => ui.label(format!("读取简介失败：{err}")),
-                };
+                    Ok(Some(summary)) => { ui.label(crate::ai::render_analysis_text(&summary)); }
+                    Ok(None) => { ui.label("当前视频尚未生成简介。"); }
+                    Err(err) => { ui.label(format!("读取简介失败：{err}")); }
+                }
             });
         }
     }
@@ -593,9 +622,7 @@ impl AiVideoApp {
 
     fn generate_visible_thumbnails(&mut self) {
         let count = self.videos.len();
-        for video in &self.videos {
-            let _ = crate::core::cache_manager::extract_thumbnail(&video.path, &video.hash, 0.0);
-        }
+        for video in &self.videos { let _ = crate::core::cache_manager::extract_thumbnail(&video.path, &video.hash, 0.0); }
         self.thumbnails.clear();
         self.thumbnail_errors.clear();
         self.chat_log.push(format!("系统：已尝试生成 {} 个视频缩略图。", count));
@@ -611,28 +638,48 @@ impl AiVideoApp {
 
     fn start_selected_model(&mut self) {
         if self.model_child.is_some() {
-            self.model_status = "模型进程已在运行。".to_string();
+            self.show_notice("模型已在运行", "本程序已经记录了一个模型进程，请先终止后再启动。".to_string());
+            return;
+        }
+        if self.has_pending_model_check(ModelCheckKind::Start) {
+            self.show_notice("正在检测", "模型启动检测尚未完成，请不要重复点击启动。".to_string());
+            return;
+        }
+        if models::is_llama_service_ready(Duration::from_millis(250)) {
+            self.model_status = "7080 服务已经可用，未重复启动脚本。".to_string();
+            self.show_notice("模型服务已可用", "检测到 127.0.0.1:7080 已经可连接，因此没有再次启动脚本。".to_string());
             return;
         }
         let Some(script) = self.selected_model_script.clone() else {
-            self.model_status = format!("未选择启动文件。请将 .bat/.cmd 或 .sh 放入 {}", models::ensure_models_dir().display());
+            self.show_notice("未选择启动文件", format!("请将 .bat/.cmd 或 .sh 放入 {}，然后点击刷新。", models::ensure_models_dir().display()));
             return;
         };
         self.settings.model_name = script.file_stem().and_then(|s| s.to_str()).unwrap_or("local-llamacpp").to_string();
         match models::start_model_script(&script) {
             Ok(child) => {
+                let pid = child.id();
                 self.model_child = Some(child);
-                self.model_status = format!("已启动：{}", script.display());
+                self.model_status = format!("已启动 PID {}，2 秒后检测 7080。", pid);
+                self.pending_model_check = Some(PendingModelCheck { due: Instant::now() + Duration::from_secs(2), kind: ModelCheckKind::Start });
+                self.show_notice("已发送启动命令", format!("已启动脚本：{}\n进程 PID：{}\n程序会自动检测 127.0.0.1:7080 是否可用。", script.display(), pid));
             }
-            Err(err) => self.model_status = err,
+            Err(err) => {
+                self.model_status = err.clone();
+                self.show_notice("启动失败", err);
+            }
         }
     }
 
     fn stop_model(&mut self) {
         if let Some(mut child) = self.model_child.take() {
+            let pid = child.id();
             models::stop_model_process(&mut child);
-            self.model_status = "模型进程已停止。".to_string();
-        } else { self.model_status = "没有正在运行的模型进程。".to_string(); }
+            self.model_status = format!("已终止 PID {}，1 秒后检测端口。", pid);
+            self.pending_model_check = Some(PendingModelCheck { due: Instant::now() + Duration::from_secs(1), kind: ModelCheckKind::Stop });
+            self.show_notice("已发送终止命令", format!("已按本程序记录的 PID 终止模型进程：{}\n程序会在 1 秒后检测 7080 是否释放。", pid));
+        } else {
+            self.show_notice("没有可终止的进程", "本程序没有记录到由自己启动的模型进程。为避免误杀，不会终止外部进程。".to_string());
+        }
     }
 
     fn poll_model_process(&mut self) {
@@ -644,12 +691,61 @@ impl AiVideoApp {
         }
     }
 
+    fn poll_model_health(&mut self) {
+        let Some(check) = self.pending_model_check.clone() else { return; };
+        if Instant::now() < check.due { return; }
+        self.pending_model_check = None;
+        let ready = models::is_llama_service_ready(Duration::from_millis(300));
+        match (check.kind, ready) {
+            (ModelCheckKind::Start, true) => {
+                self.model_status = "7080 服务已连接，模型运行正常。".to_string();
+                self.show_notice("模型启动成功", "已成功连接 127.0.0.1:7080。".to_string());
+            }
+            (ModelCheckKind::Start, false) => {
+                self.model_status = "未能连接 7080，请检查脚本和模型日志。".to_string();
+                self.show_notice("模型可能未就绪", "启动命令已发送，但当前无法连接 127.0.0.1:7080。模型可能仍在加载，或脚本启动失败。".to_string());
+            }
+            (ModelCheckKind::Stop, false) => {
+                self.model_status = "7080 已释放。".to_string();
+                self.show_notice("模型已终止", "检测到 127.0.0.1:7080 已不可连接，端口已释放。".to_string());
+            }
+            (ModelCheckKind::Stop, true) => {
+                self.model_status = "7080 仍可连接，可能存在外部模型进程。".to_string();
+                self.show_notice("端口仍被占用", "已终止本程序记录的 PID，但 127.0.0.1:7080 仍可连接。可能还有外部启动的模型进程。".to_string());
+            }
+        }
+    }
+
+    fn has_pending_model_check(&self, kind: ModelCheckKind) -> bool {
+        self.pending_model_check.as_ref().map(|check| check.kind == kind).unwrap_or(false)
+    }
+
+    fn show_notice(&mut self, title: &str, body: String) {
+        self.model_notice_title = title.to_string();
+        self.model_notice_body = body;
+        self.model_notice_open = true;
+    }
+
+    fn show_model_notice(&mut self, ctx: &egui::Context) {
+        if !self.model_notice_open { return; }
+        let mut open = self.model_notice_open;
+        egui::Window::new(self.model_notice_title.clone())
+            .collapsible(false)
+            .resizable(true)
+            .default_width(380.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(&self.model_notice_body);
+                ui.add_space(8.0);
+                if ui.button("知道了").clicked() { self.model_notice_open = false; }
+            });
+        self.model_notice_open = open && self.model_notice_open;
+    }
+
     fn current_video(&self) -> Option<&VideoMeta> { self.selected_index.and_then(|idx| self.videos.get(idx)) }
 }
 
-impl Drop for AiVideoApp {
-    fn drop(&mut self) { self.stop_model(); }
-}
+impl Drop for AiVideoApp { fn drop(&mut self) { self.stop_model(); } }
 
 fn load_texture_from_path(ctx: &egui::Context, path: &str, key: &str) -> Result<egui::TextureHandle, String> {
     let image = image::open(Path::new(path)).map_err(|err| err.to_string())?.to_rgba8();
@@ -676,6 +772,58 @@ fn format_duration(seconds: f64) -> String {
     let mins = total / 60;
     let secs = total % 60;
     format!("{mins}:{secs:02}")
+}
+
+fn elide_middle(text: &str, max_chars: usize) -> String {
+    let count = text.chars().count();
+    if count <= max_chars { return text.to_string(); }
+    if max_chars <= 3 { return "...".to_string(); }
+    let keep = max_chars - 3;
+    let left = keep / 2;
+    let right = keep - left;
+    let start: String = text.chars().take(left).collect();
+    let end: String = text.chars().rev().take(right).collect::<String>().chars().rev().collect();
+    format!("{start}...{end}")
+}
+
+fn setting_text(ui: &mut egui::Ui, label: &str, value: &mut String) {
+    ui.vertical(|ui| {
+        ui.label(label);
+        ui.add_sized([ui.available_width().min(560.0), 24.0], egui::TextEdit::singleline(value));
+    });
+    ui.add_space(8.0);
+}
+
+fn setting_slider_usize(ui: &mut egui::Ui, label: &str, value: &mut usize, range: std::ops::RangeInclusive<usize>) {
+    ui.vertical(|ui| {
+        ui.label(label);
+        ui.add_sized([ui.available_width().min(560.0), 24.0], egui::Slider::new(value, range));
+    });
+    ui.add_space(8.0);
+}
+
+fn setting_slider_u32(ui: &mut egui::Ui, label: &str, value: &mut u32, range: std::ops::RangeInclusive<u32>) {
+    ui.vertical(|ui| {
+        ui.label(label);
+        ui.add_sized([ui.available_width().min(560.0), 24.0], egui::Slider::new(value, range));
+    });
+    ui.add_space(8.0);
+}
+
+fn setting_slider_u64(ui: &mut egui::Ui, label: &str, value: &mut u64, range: std::ops::RangeInclusive<u64>) {
+    ui.vertical(|ui| {
+        ui.label(label);
+        ui.add_sized([ui.available_width().min(560.0), 24.0], egui::Slider::new(value, range));
+    });
+    ui.add_space(8.0);
+}
+
+fn setting_slider_f32(ui: &mut egui::Ui, label: &str, value: &mut f32, range: std::ops::RangeInclusive<f32>) {
+    ui.vertical(|ui| {
+        ui.label(label);
+        ui.add_sized([ui.available_width().min(560.0), 24.0], egui::Slider::new(value, range));
+    });
+    ui.add_space(8.0);
 }
 
 fn default_db_path() -> PathBuf { dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")).join("ai-video").join("ai-video.sqlite3") }
