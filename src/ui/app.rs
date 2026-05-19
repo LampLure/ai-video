@@ -172,11 +172,12 @@ impl AiVideoApp {
                 if ui.button("开始/恢复队列").clicked() {
                     self.ai_running = true;
                     self.ai_paused = false;
-                    if let Some(video) = self.current_video() {
-                        self.chat_log.push(format!("系统：开始分析 {}", video.name));
+                    let current = self.current_video().map(|video| (video.name.clone(), video.duration));
+                    if let Some((video_name, duration)) = current {
+                        self.chat_log.push(format!("系统：开始分析 {}", video_name));
                         self.chat_log.push(format!(
                             "AI：已接收视频总时长 {:.2}s、最大图片数 {}、最大音频段数 {}。",
-                            video.duration, self.settings.max_images, self.settings.max_audio_segments
+                            duration, self.settings.max_images, self.settings.max_audio_segments
                         ));
                     } else {
                         self.chat_log.push("系统：没有可分析的视频。".to_string());
