@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::SystemTime;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachePaths {
@@ -92,6 +93,36 @@ pub fn extract_audio_segment(video_path: &str, video_hash: &str, center_seconds:
 pub fn clear_cache(root: &Path) -> Result<()> {
     if root.exists() {
         fs::remove_dir_all(root)?;
+    }
+    Ok(())
+}
+
+pub fn enforce_cache_size_limit(root: &Path, limit_mb: u64) -> Result<u64> {
+    if !root.exists() { return Ok(0); }
+    let limit = limit_mb.saturating_mul(1024).saturating_mul(1024);
+    let mut files = Vec::new();
+    collect_cache_files(root, &mut files)?;
+    let mut total: u64 = files.iter().map(|(_, size, _)| *size).sum();
+    if total <= limit { return Ok(0); }
+    files.sort_by_key(|(_, _, modified)| *modified);
+    let mut removed = 0;
+    for (path, size, _) in files {
+        if total <= limit { break; }
+        if fs::remove_file(&path).is_ok() {
+            total = total.saturating_sub(size);
+            removed += size;
+        }
+    }
+    Ok(removed)
+}
+
+fn collect_cache_files(dir: &Path, out: &mut Vec<(PathBuf, u64, SystemTime)>) -> Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let meta = entry.metadata()?;
+        if meta.is_dir() { collect_cache_files(&path, out)?; }
+        else if meta.is_file() { out.push((path, meta.len(), meta.modified().unwrap_or(SystemTime::UNIX_EPOCH))); }
     }
     Ok(())
 }
