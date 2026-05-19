@@ -50,6 +50,7 @@ pub struct AiVideoApp {
     model_notice_open: bool,
     model_notice_title: String,
     model_notice_body: String,
+    bottom_panel_height: f32,
 }
 
 impl Default for AiVideoApp {
@@ -86,6 +87,7 @@ impl Default for AiVideoApp {
             model_notice_open: false,
             model_notice_title: String::new(),
             model_notice_body: String::new(),
+            bottom_panel_height: 86.0,
         }
     }
 }
@@ -117,9 +119,7 @@ impl eframe::App for AiVideoApp {
 
         if matches!(self.mode, ScreenMode::Overview | ScreenMode::Playback | ScreenMode::AiAnalysis) {
             egui::TopBottomPanel::bottom("bottom_input")
-                .resizable(true)
-                .default_height(if self.mode == ScreenMode::Overview { 86.0 } else { 240.0 })
-                .height_range(36.0..=720.0)
+                .exact_height(self.bottom_panel_height.clamp(36.0, 720.0))
                 .frame(panel_frame())
                 .show(ctx, |ui| self.bottom_input_area(ui));
         }
@@ -158,6 +158,7 @@ impl AiVideoApp {
                 self.folder = Some(folder.clone());
                 self.scan_folder(folder);
                 self.mode = ScreenMode::Overview;
+                self.bottom_panel_height = self.bottom_panel_height.min(120.0).max(64.0);
             }
         }
         if nav_button(ui, "分析文件/生成缩略图").clicked() { self.generate_visible_thumbnails(); }
@@ -171,16 +172,24 @@ impl AiVideoApp {
         });
 
         ui.add_space(8.0);
-        if nav_button(ui, "媒体总览").clicked() { self.mode = ScreenMode::Overview; }
+        if nav_button(ui, "媒体总览").clicked() {
+            self.mode = ScreenMode::Overview;
+            self.bottom_panel_height = self.bottom_panel_height.min(120.0).max(64.0);
+        }
         if nav_button(ui, "进入播放").clicked() {
             if self.selected_index.is_none() && !self.videos.is_empty() { self.select_video(0); }
             self.mode = ScreenMode::Playback;
+            if self.bottom_panel_height < 180.0 { self.bottom_panel_height = 240.0; }
         }
         if nav_button(ui, if self.mode == ScreenMode::AiAnalysis { "退出 AI 分析" } else { "AI 分析" }).clicked() {
-            if self.mode == ScreenMode::AiAnalysis { self.mode = ScreenMode::Overview; }
+            if self.mode == ScreenMode::AiAnalysis {
+                self.mode = ScreenMode::Overview;
+                self.bottom_panel_height = self.bottom_panel_height.min(120.0).max(64.0);
+            }
             else {
                 if self.selected_index.is_none() && !self.videos.is_empty() { self.select_video(0); }
                 self.mode = ScreenMode::AiAnalysis;
+                if self.bottom_panel_height < 180.0 { self.bottom_panel_height = 240.0; }
                 self.chat_log.push("系统：已切换到 AI 分析模式。".to_string());
             }
         }
@@ -203,8 +212,7 @@ impl AiVideoApp {
             if ui.button("刷新").clicked() { self.refresh_model_scripts(); }
             let can_start = self.model_child.is_none() && !self.has_pending_model_check(ModelCheckKind::Start);
             if ui.add_enabled(can_start, egui::Button::new("启动")).clicked() { self.start_selected_model(); }
-            let can_stop = self.model_child.is_some();
-            if ui.add_enabled(can_stop, egui::Button::new("终止")).clicked() { self.stop_model(); }
+            if ui.button("终止").clicked() { self.stop_model(); }
         });
         let selected_text = self.selected_model_script
             .as_ref()
@@ -240,6 +248,7 @@ impl AiVideoApp {
                     if let Some(idx) = self.videos.iter().position(|v| v.path == result.path) {
                         self.select_video(idx);
                         self.mode = ScreenMode::Playback;
+                        if self.bottom_panel_height < 180.0 { self.bottom_panel_height = 240.0; }
                     }
                 }
                 if let Some(summary) = &result.summary { ui.small(summary); }
@@ -284,6 +293,7 @@ impl AiVideoApp {
         if response.clicked() {
             self.select_video(idx);
             self.mode = ScreenMode::Playback;
+            if self.bottom_panel_height < 180.0 { self.bottom_panel_height = 240.0; }
         }
     }
 
@@ -291,8 +301,14 @@ impl AiVideoApp {
         ui.horizontal(|ui| {
             ui.heading("视频播放界面");
             ui.separator();
-            if ui.button("返回媒体总览").clicked() { self.mode = ScreenMode::Overview; }
-            if ui.button("切到 AI 分析").clicked() { self.mode = ScreenMode::AiAnalysis; }
+            if ui.button("返回媒体总览").clicked() {
+                self.mode = ScreenMode::Overview;
+                self.bottom_panel_height = self.bottom_panel_height.min(120.0).max(64.0);
+            }
+            if ui.button("切到 AI 分析").clicked() {
+                self.mode = ScreenMode::AiAnalysis;
+                if self.bottom_panel_height < 180.0 { self.bottom_panel_height = 240.0; }
+            }
         });
         ui.separator();
         self.preview_panel(ui, ctx, "请先在媒体总览中选择一个视频。");
@@ -400,6 +416,8 @@ impl AiVideoApp {
     }
 
     fn bottom_input_area(&mut self, ui: &mut egui::Ui) {
+        self.bottom_resize_handle(ui);
+        ui.separator();
         if self.mode == ScreenMode::Overview {
             ui.horizontal(|ui| {
                 ui.label("搜索");
@@ -410,6 +428,16 @@ impl AiVideoApp {
             return;
         }
         self.bottom_chat(ui);
+    }
+
+    fn bottom_resize_handle(&mut self, ui: &mut egui::Ui) {
+        let (rect, response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 8.0), egui::Sense::click_and_drag());
+        ui.painter().rect_filled(rect.shrink2(egui::vec2(0.0, 2.5)), 2.0, egui::Color32::from_gray(58));
+        if response.dragged() {
+            self.bottom_panel_height = (self.bottom_panel_height - response.drag_delta().y).clamp(36.0, 720.0);
+            ui.ctx().request_repaint();
+        }
+        response.on_hover_cursor(egui::CursorIcon::ResizeVertical);
     }
 
     fn bottom_chat(&mut self, ui: &mut egui::Ui) {
@@ -674,11 +702,18 @@ impl AiVideoApp {
         if let Some(mut child) = self.model_child.take() {
             let pid = child.id();
             models::stop_model_process(&mut child);
-            self.model_status = format!("已终止 PID {}，1 秒后检测端口。", pid);
-            self.pending_model_check = Some(PendingModelCheck { due: Instant::now() + Duration::from_secs(1), kind: ModelCheckKind::Stop });
-            self.show_notice("已发送终止命令", format!("已按本程序记录的 PID 终止模型进程：{}\n程序会在 1 秒后检测 7080 是否释放。", pid));
-        } else {
-            self.show_notice("没有可终止的进程", "本程序没有记录到由自己启动的模型进程。为避免误杀，不会终止外部进程。".to_string());
+            self.model_status = format!("已终止本程序记录的 PID {}，继续强杀 7080。", pid);
+        }
+        match models::kill_7080_processes() {
+            Ok(()) => {
+                self.model_status = "已发送 7080 端口强制终止命令，1 秒后检测端口。".to_string();
+                self.pending_model_check = Some(PendingModelCheck { due: Instant::now() + Duration::from_secs(1), kind: ModelCheckKind::Stop });
+                self.show_notice("已强制终止 7080", "已尝试杀死所有占用 127.0.0.1:7080 的进程。程序会在 1 秒后检测端口是否释放。".to_string());
+            }
+            Err(err) => {
+                self.model_status = err.clone();
+                self.show_notice("终止失败", err);
+            }
         }
     }
 
@@ -707,11 +742,11 @@ impl AiVideoApp {
             }
             (ModelCheckKind::Stop, false) => {
                 self.model_status = "7080 已释放。".to_string();
-                self.show_notice("模型已终止", "检测到 127.0.0.1:7080 已不可连接，端口已释放。".to_string());
+                self.show_notice("7080 已释放", "检测到 127.0.0.1:7080 已不可连接。".to_string());
             }
             (ModelCheckKind::Stop, true) => {
-                self.model_status = "7080 仍可连接，可能存在外部模型进程。".to_string();
-                self.show_notice("端口仍被占用", "已终止本程序记录的 PID，但 127.0.0.1:7080 仍可连接。可能还有外部启动的模型进程。".to_string());
+                self.model_status = "7080 仍可连接，可再次点击终止。".to_string();
+                self.show_notice("7080 仍可连接", "强制终止后 7080 仍可连接。可以再次点击“终止”，程序会继续尝试杀死占用端口的进程。".to_string());
             }
         }
     }
@@ -745,7 +780,11 @@ impl AiVideoApp {
     fn current_video(&self) -> Option<&VideoMeta> { self.selected_index.and_then(|idx| self.videos.get(idx)) }
 }
 
-impl Drop for AiVideoApp { fn drop(&mut self) { self.stop_model(); } }
+impl Drop for AiVideoApp {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.model_child.take() { models::stop_model_process(&mut child); }
+    }
+}
 
 fn load_texture_from_path(ctx: &egui::Context, path: &str, key: &str) -> Result<egui::TextureHandle, String> {
     let image = image::open(Path::new(path)).map_err(|err| err.to_string())?.to_rgba8();
