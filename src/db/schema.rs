@@ -22,6 +22,8 @@ CREATE TABLE IF NOT EXISTS video_summaries (
     video_id INTEGER NOT NULL UNIQUE,
     title TEXT NOT NULL,
     summary TEXT NOT NULL,
+    tags_text TEXT NOT NULL DEFAULT '',
+    scenes_text TEXT NOT NULL DEFAULT '',
     structured_json TEXT NOT NULL,
     model_name TEXT NOT NULL,
     generated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -36,31 +38,4 @@ CREATE VIRTUAL TABLE IF NOT EXISTS video_search_fts USING fts5(
     scenes_text,
     content=''
 );
-
-CREATE TRIGGER IF NOT EXISTS video_summaries_ai AFTER INSERT ON video_summaries BEGIN
-    INSERT INTO video_search_fts(video_id, title, summary, tags, scenes_text)
-    VALUES (
-        new.video_id,
-        new.title,
-        new.summary,
-        json_extract(new.structured_json, '$.tags'),
-        json_extract(new.structured_json, '$.scenes')
-    );
-END;
-
-CREATE TRIGGER IF NOT EXISTS video_summaries_au AFTER UPDATE ON video_summaries BEGIN
-    DELETE FROM video_search_fts WHERE video_id = old.video_id;
-    INSERT INTO video_search_fts(video_id, title, summary, tags, scenes_text)
-    VALUES (
-        new.video_id,
-        new.title,
-        new.summary,
-        json_extract(new.structured_json, '$.tags'),
-        json_extract(new.structured_json, '$.scenes')
-    );
-END;
-
-CREATE TRIGGER IF NOT EXISTS video_summaries_ad AFTER DELETE ON video_summaries BEGIN
-    DELETE FROM video_search_fts WHERE video_id = old.video_id;
-END;
 "#;
