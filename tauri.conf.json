@@ -1,0 +1,17 @@
+{
+  "build": {
+    "beforeBuildCommand": "",
+    "beforeDevCommand": "",
+    "devPath": "public",
+    "distDir": "public"
+  },
+  "package": {
+    "productName": "AI Video",
+    "version": "0.1.0"
+  },
+  "tauri": {
+    "allowlist": { "all": true },
+    "bundle": { "active": true, "identifier": "com.lamplure.ai-video" },
+    "windows": [{ "title": "AI Video", "width": 1200, "height": 780, "minWidth": 800, "minHeight": 600 }]
+  }
+}
