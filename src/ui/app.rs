@@ -6,7 +6,8 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ScreenMode {
-    Normal,
+    Overview,
+    Playback,
     AiAnalysis,
     Settings,
 }
@@ -39,7 +40,7 @@ pub struct AiVideoApp {
 impl Default for AiVideoApp {
     fn default() -> Self {
         Self {
-            mode: ScreenMode::Normal,
+            mode: ScreenMode::Overview,
             settings_section: SettingsSection::AiLimits,
             settings: AppSettings::default(),
             folder: None,
@@ -63,43 +64,36 @@ impl eframe::App for AiVideoApp {
 
         egui::TopBottomPanel::top("top_bar")
             .frame(panel_frame())
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.heading("AI Video");
-                    ui.separator();
-                    ui.label(&self.scan_status);
-                    if let Some(folder) = &self.folder {
-                        ui.separator();
-                        ui.small(format!("当前目录：{}", folder.display()));
-                    }
-                });
-            });
+            .show(ctx, |ui| self.top_bar(ui));
 
-        egui::SidePanel::left("left_sidebar")
+        egui::SidePanel::left("control_panel")
             .resizable(true)
-            .default_width(260.0)
-            .width_range(180.0..=420.0)
+            .default_width(270.0)
+            .width_range(220.0..=380.0)
             .frame(panel_frame())
-            .show(ctx, |ui| self.left_sidebar(ui));
+            .show(ctx, |ui| self.left_control_panel(ui));
 
         if self.mode == ScreenMode::AiAnalysis {
-            egui::SidePanel::right("right_video_list")
+            egui::SidePanel::right("ai_video_strip")
                 .resizable(true)
                 .default_width(230.0)
-                .width_range(160.0..=360.0)
+                .width_range(170.0..=360.0)
                 .frame(panel_frame())
                 .show(ctx, |ui| self.right_ai_video_list(ui));
         }
 
-        egui::TopBottomPanel::bottom("bottom_chat")
-            .resizable(true)
-            .default_height(210.0)
-            .height_range(120.0..=420.0)
-            .frame(panel_frame())
-            .show(ctx, |ui| self.bottom_chat(ui));
+        if matches!(self.mode, ScreenMode::Playback | ScreenMode::AiAnalysis) {
+            egui::TopBottomPanel::bottom("bottom_chat")
+                .resizable(true)
+                .default_height(210.0)
+                .height_range(120.0..=420.0)
+                .frame(panel_frame())
+                .show(ctx, |ui| self.bottom_chat(ui));
+        }
 
         egui::CentralPanel::default().frame(content_frame()).show(ctx, |ui| match self.mode {
-            ScreenMode::Normal => self.main_preview(ui),
+            ScreenMode::Overview => self.overview_grid(ui),
+            ScreenMode::Playback => self.playback_view(ui),
             ScreenMode::AiAnalysis => self.ai_analysis_view(ui),
             ScreenMode::Settings => self.settings_view(ui),
         });
@@ -107,21 +101,59 @@ impl eframe::App for AiVideoApp {
 }
 
 impl AiVideoApp {
-    fn left_sidebar(&mut self, ui: &mut egui::Ui) {
-        ui.vertical_centered(|ui| ui.heading("功能"));
-        ui.add_space(8.0);
+    fn top_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.heading("AI Video");
+            ui.separator();
+            ui.label(match self.mode {
+                ScreenMode::Overview => "总览模式",
+                ScreenMode::Playback => "播放模式",
+                ScreenMode::AiAnalysis => "AI 分析模式",
+                ScreenMode::Settings => "设置",
+            });
+            ui.separator();
+            ui.label(&self.scan_status);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label("FFmpeg: ffmpeg");
+            });
+        });
+    }
 
-        if nav_button(ui, "打开文件夹").clicked() {
+    fn left_control_panel(&mut self, ui: &mut egui::Ui) {
+        ui.heading("控制面板");
+        ui.separator();
+
+        if nav_button(ui, "选择文件夹").clicked() {
             if let Some(folder) = rfd::FileDialog::new().pick_folder() {
                 self.folder = Some(folder.clone());
                 self.scan_folder(folder);
+                self.mode = ScreenMode::Overview;
             }
         }
-        if nav_button(ui, "分析文件").clicked() {
-            self.mode = ScreenMode::Normal;
-            self.chat_log.push("系统：已切换到普通分析模式。".to_string());
+
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.label(egui::RichText::new("当前目录").strong());
+            if let Some(folder) = &self.folder {
+                ui.small(folder.display().to_string());
+            } else {
+                ui.small("未选择");
+            }
+        });
+
+        ui.add_space(8.0);
+        if nav_button(ui, "媒体总览").clicked() {
+            self.mode = ScreenMode::Overview;
+        }
+        if nav_button(ui, "进入播放").clicked() {
+            if self.selected_index.is_none() && !self.videos.is_empty() {
+                self.selected_index = Some(0);
+            }
+            self.mode = ScreenMode::Playback;
         }
         if nav_button(ui, "AI 分析").clicked() {
+            if self.selected_index.is_none() && !self.videos.is_empty() {
+                self.selected_index = Some(0);
+            }
             self.mode = ScreenMode::AiAnalysis;
             self.chat_log.push("系统：已切换到 AI 分析模式。".to_string());
         }
@@ -129,35 +161,118 @@ impl AiVideoApp {
             self.mode = ScreenMode::Settings;
         }
 
-        ui.separator();
-        ui.label(egui::RichText::new("搜索").strong());
-        ui.horizontal(|ui| {
-            let search_changed = ui.text_edit_singleline(&mut self.search_query).changed();
-            if search_changed || ui.button("搜索").clicked() {
-                self.search_current_database();
-            }
-        });
-        if !self.search_results.is_empty() {
-            ui.collapsing(format!("搜索结果：{}", self.search_results.len()), |ui| {
-                for result in &self.search_results {
-                    ui.small(format!("{} - {}", result.video_id, result.title.as_deref().unwrap_or(&result.name)));
-                }
+        ui.add_space(10.0);
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.label(egui::RichText::new("截图设置").strong());
+            ui.horizontal(|ui| {
+                ui.label("间隔");
+                ui.add(egui::DragValue::new(&mut self.settings.audio_clip_seconds).speed(1.0).range(1.0..=60.0));
+                ui.label("秒");
             });
-        }
+            ui.checkbox(&mut self.settings.debug_mode, "调试模式");
+        });
 
-        ui.separator();
-        ui.label(egui::RichText::new(format!("视频列表：{}", self.videos.len())).strong());
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            for idx in 0..self.videos.len() {
-                self.video_card(ui, idx, false);
+        ui.add_space(10.0);
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.label(egui::RichText::new("目录信息").strong());
+            ui.label(format!("视频数：{}", self.videos.len()));
+            if let Some(idx) = self.selected_index {
+                if let Some(video) = self.videos.get(idx) {
+                    ui.small(format!("当前：{}", video.name));
+                }
             }
         });
     }
 
-    fn main_preview(&mut self, ui: &mut egui::Ui) {
-        ui.heading("主体区域：当前视频预览 + 播放");
+    fn overview_grid(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.heading("媒体总览");
+            ui.separator();
+            ui.label(format!("{} 个视频", self.videos.len()));
+        });
+        ui.add_space(8.0);
+
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("搜索");
+                let response = ui.add_sized([320.0, 24.0], egui::TextEdit::singleline(&mut self.search_query).hint_text("按文件名过滤"));
+                if response.changed() {
+                    self.search_current_database();
+                }
+                if ui.button("清空").clicked() {
+                    self.search_query.clear();
+                    self.search_results.clear();
+                }
+                ui.separator();
+                ui.label("排序：文件名");
+            });
+        });
+
+        ui.add_space(12.0);
+        if self.videos.is_empty() {
+            ui.centered_and_justified(|ui| {
+                ui.label("点击左侧“选择文件夹”后，视频会以卡片网格排列在这里。点击某个视频进入播放界面。");
+            });
+            return;
+        }
+
+        let card_width = 310.0;
+        let spacing = 16.0;
+        let cols = ((ui.available_width() + spacing) / (card_width + spacing)).floor().max(1.0) as usize;
+        let indices = self.filtered_video_indices();
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            for row in indices.chunks(cols) {
+                ui.horizontal(|ui| {
+                    for &idx in row {
+                        self.overview_video_card(ui, idx, card_width);
+                        ui.add_space(spacing);
+                    }
+                });
+                ui.add_space(14.0);
+            }
+        });
+    }
+
+    fn overview_video_card(&mut self, ui: &mut egui::Ui, idx: usize, width: f32) {
+        let selected = self.selected_index == Some(idx);
+        let video = &self.videos[idx];
+        let fill = if selected { egui::Color32::from_gray(44) } else { egui::Color32::from_gray(26) };
+        let response = egui::Frame::group(ui.style())
+            .fill(fill)
+            .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(if selected { 95 } else { 42 })))
+            .show(ui, |ui| {
+                ui.set_width(width);
+                let thumb_size = egui::vec2(width - 20.0, 170.0);
+                let (rect, _) = ui.allocate_exact_size(thumb_size, egui::Sense::click());
+                ui.painter().rect_filled(rect, 4.0, egui::Color32::BLACK);
+                ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "缩略图", egui::TextStyle::Small.resolve(ui.style()), egui::Color32::from_gray(170));
+                ui.add_space(6.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(egui::RichText::new(&video.name).strong());
+                    ui.small(format!("{:.1}s  {}x{}", video.duration, video.width, video.height));
+                    ui.small(format!("序号 {}", idx + 1));
+                });
+            })
+            .response;
+        if response.clicked() {
+            self.selected_index = Some(idx);
+            self.mode = ScreenMode::Playback;
+        }
+    }
+
+    fn playback_view(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.heading("视频播放界面");
+            ui.separator();
+            if ui.button("返回媒体总览").clicked() {
+                self.mode = ScreenMode::Overview;
+            }
+            if ui.button("切到 AI 分析").clicked() {
+                self.mode = ScreenMode::AiAnalysis;
+            }
+        });
         ui.separator();
-        self.preview_panel(ui, "普通模式：点击左侧视频后在这里播放");
+        self.preview_panel(ui, "请先在媒体总览中选择一个视频。");
     }
 
     fn ai_analysis_view(&mut self, ui: &mut egui::Ui) {
@@ -183,11 +298,9 @@ impl AiVideoApp {
                         self.chat_log.push("系统：没有可分析的视频。".to_string());
                     }
                 }
-                if ui.button("暂停队列，允许提问").clicked() {
-                    if self.ai_running {
-                        self.ai_paused = true;
-                        self.chat_log.push("系统：后台分析已暂停，现在允许用户针对当前视频提问。".to_string());
-                    }
+                if ui.button("暂停队列，允许提问").clicked() && self.ai_running {
+                    self.ai_paused = true;
+                    self.chat_log.push("系统：后台分析已暂停，现在允许用户针对当前视频提问。".to_string());
                 }
             });
             let state = if self.ai_running && self.ai_paused {
@@ -230,11 +343,11 @@ impl AiVideoApp {
                     }
                     SettingsSection::Cache => {
                         ui.label("缓存目录结构：cache/thumbs、cache/frames、cache/audio");
-                        ui.label("当前策略：扫描时写入数据库；后续接入按大小清理和切换文件夹清理策略。 ");
+                        ui.label("后续接入按大小清理和切换文件夹清理策略。");
                     }
                     SettingsSection::Debug => {
                         ui.checkbox(&mut self.settings.debug_mode, "调试模式：显示原始 JSON");
-                        ui.label("非调试模式下，聊天栏仅显示清洗后的文本。 ");
+                        ui.label("非调试模式下，聊天栏仅显示清洗后的文本。");
                     }
                 }
             });
@@ -247,7 +360,7 @@ impl AiVideoApp {
         ui.label("竖直滚动视频缩略图 + 视频名");
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             for idx in 0..self.videos.len() {
-                self.video_card(ui, idx, true);
+                self.side_video_card(ui, idx);
             }
         });
     }
@@ -287,17 +400,11 @@ impl AiVideoApp {
     fn preview_panel(&mut self, ui: &mut egui::Ui, empty_hint: &str) {
         if let Some(video) = self.current_video() {
             let available_width = ui.available_width().max(320.0);
-            let preview_height = (available_width * 9.0 / 16.0).clamp(220.0, 520.0);
+            let preview_height = (available_width * 9.0 / 16.0).clamp(260.0, 560.0);
             let (rect, _) = ui.allocate_exact_size(egui::vec2(available_width, preview_height), egui::Sense::hover());
-            ui.painter().rect_filled(rect, 8.0, egui::Color32::from_gray(28));
+            ui.painter().rect_filled(rect, 8.0, egui::Color32::BLACK);
             ui.painter().rect_stroke(rect, 8.0, egui::Stroke::new(1.0, egui::Color32::from_gray(70)), egui::StrokeKind::Outside);
-            ui.painter().text(
-                rect.center(),
-                egui::Align2::CENTER_CENTER,
-                "视频播放预览区",
-                egui::TextStyle::Heading.resolve(ui.style()),
-                egui::Color32::from_gray(210),
-            );
+            ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "视频播放预览区", egui::TextStyle::Heading.resolve(ui.style()), egui::Color32::from_gray(210));
             ui.add_space(10.0);
             egui::Grid::new("video_meta_grid").num_columns(2).spacing([16.0, 6.0]).show(ui, |ui| {
                 ui.label("文件名"); ui.label(&video.name); ui.end_row();
@@ -312,16 +419,15 @@ impl AiVideoApp {
         }
     }
 
-    fn video_card(&mut self, ui: &mut egui::Ui, idx: usize, compact: bool) {
+    fn side_video_card(&mut self, ui: &mut egui::Ui, idx: usize) {
         let selected = self.selected_index == Some(idx);
         let video = &self.videos[idx];
         let response = egui::Frame::group(ui.style())
             .fill(if selected { egui::Color32::from_gray(58) } else { egui::Color32::from_gray(32) })
             .show(ui, |ui| {
-                let thumb_height = if compact { 70.0 } else { 82.0 };
                 let width = ui.available_width().max(120.0);
-                let (rect, _) = ui.allocate_exact_size(egui::vec2(width, thumb_height), egui::Sense::click());
-                ui.painter().rect_filled(rect, 4.0, egui::Color32::from_gray(18));
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 76.0), egui::Sense::click());
+                ui.painter().rect_filled(rect, 4.0, egui::Color32::BLACK);
                 ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "缩略图", egui::TextStyle::Small.resolve(ui.style()), egui::Color32::from_gray(160));
                 ui.label(egui::RichText::new(&video.name).small());
                 ui.small(format!("{:.1}s  {}x{}", video.duration, video.width, video.height));
@@ -339,12 +445,27 @@ impl AiVideoApp {
         }
     }
 
+    fn filtered_video_indices(&self) -> Vec<usize> {
+        let query = self.search_query.trim().to_ascii_lowercase();
+        self.videos
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, video)| {
+                if query.is_empty() || video.name.to_ascii_lowercase().contains(&query) {
+                    Some(idx)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
     fn scan_folder(&mut self, folder: PathBuf) {
         self.scan_status = format!("正在扫描：{}", folder.display());
         match scan_videos(&folder.to_string_lossy()) {
             Ok(videos) => {
                 self.videos = videos;
-                self.selected_index = if self.videos.is_empty() { None } else { Some(0) };
+                self.selected_index = None;
                 self.scan_status = format!("扫描完成：{} 个视频", self.videos.len());
                 self.persist_scanned_videos();
             }
@@ -382,7 +503,7 @@ fn default_db_path() -> PathBuf {
 }
 
 fn nav_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
-    ui.add_sized([ui.available_width(), 30.0], egui::Button::new(label))
+    ui.add_sized([ui.available_width(), 36.0], egui::Button::new(label))
 }
 
 fn panel_frame() -> egui::Frame {
@@ -395,7 +516,7 @@ fn panel_frame() -> egui::Frame {
 fn content_frame() -> egui::Frame {
     egui::Frame::default()
         .fill(egui::Color32::from_gray(18))
-        .inner_margin(egui::Margin::same(10))
+        .inner_margin(egui::Margin::same(12))
 }
 
 fn apply_gray_theme(ctx: &egui::Context) {
@@ -403,8 +524,8 @@ fn apply_gray_theme(ctx: &egui::Context) {
     visuals.window_fill = egui::Color32::from_gray(22);
     visuals.panel_fill = egui::Color32::from_gray(24);
     visuals.extreme_bg_color = egui::Color32::from_gray(8);
-    visuals.widgets.inactive.bg_fill = egui::Color32::from_gray(45);
-    visuals.widgets.hovered.bg_fill = egui::Color32::from_gray(65);
-    visuals.widgets.active.bg_fill = egui::Color32::from_gray(80);
+    visuals.widgets.inactive.bg_fill = egui::Color32::from_gray(55);
+    visuals.widgets.hovered.bg_fill = egui::Color32::from_gray(70);
+    visuals.widgets.active.bg_fill = egui::Color32::from_gray(85);
     ctx.set_visuals(visuals);
 }
