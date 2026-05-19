@@ -1,5 +1,6 @@
 use crate::ai::agent::{handle_agent_request, AgentRequest, SegmentRequestLimits};
 use crate::ai::queue::{AnalysisQueue, QueueState};
+use crate::ai::{analyze_video, ask_video_question, AnalysisResult};
 use crate::core::cache_manager::{extract_audio_segment, extract_frames};
 use crate::core::settings::AppSettings;
 use crate::core::video_manager::{scan_videos as scan_videos_inner, VideoMeta};
@@ -52,6 +53,16 @@ pub fn init_database() -> Result<String, String> {
 pub fn search_videos(query: String, limit: Option<usize>) -> Result<Vec<SearchResult>, String> {
     let db = Database::open(db_path()).map_err(to_app_error)?;
     db.search(&query, limit.unwrap_or(50)).map_err(to_app_error)
+}
+
+pub fn analyze_current_video(video: VideoMeta) -> Result<AnalysisResult, String> {
+    let settings = settings_cell().lock().map_err(|e| e.to_string())?.clone();
+    analyze_video(&video, &settings, &db_path()).map_err(to_app_error)
+}
+
+pub fn ask_video(video: VideoMeta, question: String) -> Result<String, String> {
+    let settings = settings_cell().lock().map_err(|e| e.to_string())?.clone();
+    ask_video_question(&video, &question, &settings).map_err(to_app_error)
 }
 
 pub fn start_analysis_queue(videos: Vec<VideoMeta>, start_index: usize) -> Result<QueueState, String> {
