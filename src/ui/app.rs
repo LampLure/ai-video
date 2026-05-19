@@ -7,20 +7,10 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum ScreenMode {
-    Overview,
-    Playback,
-    AiAnalysis,
-    Settings,
-}
+enum ScreenMode { Overview, Playback, AiAnalysis, Settings }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SettingsSection {
-    AiLimits,
-    Media,
-    Cache,
-    Debug,
-}
+enum SettingsSection { AiLimits, Media, Cache, Debug }
 
 pub struct AiVideoApp {
     mode: ScreenMode,
@@ -79,10 +69,7 @@ impl eframe::App for AiVideoApp {
         apply_gray_theme(ctx);
         self.tick_playback(ctx);
 
-        egui::TopBottomPanel::top("top_bar")
-            .frame(panel_frame())
-            .show(ctx, |ui| self.top_bar(ui));
-
+        egui::TopBottomPanel::top("top_bar").frame(panel_frame()).show(ctx, |ui| self.top_bar(ui));
         egui::SidePanel::left("control_panel")
             .resizable(true)
             .default_width(270.0)
@@ -130,16 +117,13 @@ impl AiVideoApp {
             });
             ui.separator();
             ui.label(&self.scan_status);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label("FFmpeg: ffmpeg");
-            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| ui.label("FFmpeg: ffmpeg"));
         });
     }
 
     fn left_control_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("控制面板");
         ui.separator();
-
         if nav_button(ui, "选择文件夹").clicked() {
             if let Some(folder) = rfd::FileDialog::new().pick_folder() {
                 self.folder = Some(folder.clone());
@@ -150,33 +134,21 @@ impl AiVideoApp {
 
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.label(egui::RichText::new("当前目录").strong());
-            if let Some(folder) = &self.folder {
-                ui.small(folder.display().to_string());
-            } else {
-                ui.small("未选择");
-            }
+            ui.small(self.folder.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "未选择".to_string()));
         });
 
         ui.add_space(8.0);
-        if nav_button(ui, "媒体总览").clicked() {
-            self.mode = ScreenMode::Overview;
-        }
+        if nav_button(ui, "媒体总览").clicked() { self.mode = ScreenMode::Overview; }
         if nav_button(ui, "进入播放").clicked() {
-            if self.selected_index.is_none() && !self.videos.is_empty() {
-                self.select_video(0);
-            }
+            if self.selected_index.is_none() && !self.videos.is_empty() { self.select_video(0); }
             self.mode = ScreenMode::Playback;
         }
         if nav_button(ui, "AI 分析").clicked() {
-            if self.selected_index.is_none() && !self.videos.is_empty() {
-                self.select_video(0);
-            }
+            if self.selected_index.is_none() && !self.videos.is_empty() { self.select_video(0); }
             self.mode = ScreenMode::AiAnalysis;
             self.chat_log.push("系统：已切换到 AI 分析模式。".to_string());
         }
-        if nav_button(ui, "设置").clicked() {
-            self.mode = ScreenMode::Settings;
-        }
+        if nav_button(ui, "设置").clicked() { self.mode = ScreenMode::Settings; }
 
         ui.add_space(10.0);
         egui::Frame::group(ui.style()).show(ui, |ui| {
@@ -193,10 +165,8 @@ impl AiVideoApp {
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.label(egui::RichText::new("目录信息").strong());
             ui.label(format!("视频数：{}", self.videos.len()));
-            if let Some(idx) = self.selected_index {
-                if let Some(video) = self.videos.get(idx) {
-                    ui.small(format!("当前：{}", video.name));
-                }
+            if let Some(idx) = self.selected_index.and_then(|i| self.videos.get(i).map(|_| i)) {
+                ui.small(format!("当前：{}", self.videos[idx].name));
             }
         });
     }
@@ -208,11 +178,8 @@ impl AiVideoApp {
             ui.label(format!("{} 个视频", self.filtered_video_indices().len()));
         });
         ui.add_space(12.0);
-
         if self.videos.is_empty() {
-            ui.centered_and_justified(|ui| {
-                ui.label("点击左侧“选择文件夹”后，视频会以卡片网格排列在这里。点击某个视频进入播放界面。");
-            });
+            ui.centered_and_justified(|ui| ui.label("点击左侧“选择文件夹”后，视频会以卡片网格排列在这里。点击某个视频进入播放界面。"));
             return;
         }
 
@@ -241,15 +208,10 @@ impl AiVideoApp {
         let fill = if selected { egui::Color32::from_gray(44) } else { egui::Color32::from_gray(26) };
         ui.painter().rect_filled(rect, 6.0, fill);
         ui.painter().rect_stroke(rect, 6.0, egui::Stroke::new(1.0, egui::Color32::from_gray(if selected { 95 } else { 42 })), egui::StrokeKind::Outside);
-
         let thumb_rect = egui::Rect::from_min_size(rect.min + egui::vec2(10.0, 10.0), egui::vec2(size.x - 20.0, 170.0));
         self.paint_thumbnail(ui, ctx, &video, thumb_rect);
-
-        let title_pos = egui::pos2(rect.center().x, thumb_rect.max.y + 20.0);
-        ui.painter().text(title_pos, egui::Align2::CENTER_CENTER, &video.name, egui::TextStyle::Button.resolve(ui.style()), egui::Color32::from_gray(235));
-        let duration_pos = egui::pos2(rect.center().x, thumb_rect.max.y + 42.0);
-        ui.painter().text(duration_pos, egui::Align2::CENTER_CENTER, format_duration(video.duration), egui::TextStyle::Small.resolve(ui.style()), egui::Color32::from_gray(165));
-
+        ui.painter().text(egui::pos2(rect.center().x, thumb_rect.max.y + 20.0), egui::Align2::CENTER_CENTER, &video.name, egui::TextStyle::Button.resolve(ui.style()), egui::Color32::from_gray(235));
+        ui.painter().text(egui::pos2(rect.center().x, thumb_rect.max.y + 42.0), egui::Align2::CENTER_CENTER, format_duration(video.duration), egui::TextStyle::Small.resolve(ui.style()), egui::Color32::from_gray(165));
         if response.clicked() {
             self.select_video(idx);
             self.mode = ScreenMode::Playback;
@@ -260,12 +222,8 @@ impl AiVideoApp {
         ui.horizontal(|ui| {
             ui.heading("视频播放界面");
             ui.separator();
-            if ui.button("返回媒体总览").clicked() {
-                self.mode = ScreenMode::Overview;
-            }
-            if ui.button("切到 AI 分析").clicked() {
-                self.mode = ScreenMode::AiAnalysis;
-            }
+            if ui.button("返回媒体总览").clicked() { self.mode = ScreenMode::Overview; }
+            if ui.button("切到 AI 分析").clicked() { self.mode = ScreenMode::AiAnalysis; }
         });
         ui.separator();
         self.preview_panel(ui, ctx, "请先在媒体总览中选择一个视频。");
@@ -275,7 +233,6 @@ impl AiVideoApp {
         ui.heading("AI 分析模式");
         ui.separator();
         self.preview_panel(ui, ctx, "AI 分析模式：点击右侧缩略图切换预览区");
-
         ui.add_space(10.0);
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.label(egui::RichText::new("队列与控制").strong());
@@ -283,13 +240,9 @@ impl AiVideoApp {
                 if ui.button("开始/恢复队列").clicked() {
                     self.ai_running = true;
                     self.ai_paused = false;
-                    let current = self.current_video().map(|video| (video.name.clone(), video.duration));
-                    if let Some((video_name, duration)) = current {
+                    if let Some((video_name, duration)) = self.current_video().map(|video| (video.name.clone(), video.duration)) {
                         self.chat_log.push(format!("系统：开始分析 {}", video_name));
-                        self.chat_log.push(format!(
-                            "AI：已接收视频总时长 {}、最大图片数 {}、最大音频段数 {}。",
-                            format_duration(duration), self.settings.max_images, self.settings.max_audio_segments
-                        ));
+                        self.chat_log.push(format!("AI：已接收视频总时长 {}、最大图片数 {}、最大音频段数 {}。", format_duration(duration), self.settings.max_images, self.settings.max_audio_segments));
                     } else {
                         self.chat_log.push("系统：没有可分析的视频。".to_string());
                     }
@@ -348,9 +301,7 @@ impl AiVideoApp {
         ui.heading("右侧栏：AI 队列");
         ui.separator();
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            for idx in 0..self.videos.len() {
-                self.side_video_card(ui, ctx, idx);
-            }
+            for idx in 0..self.videos.len() { self.side_video_card(ui, ctx, idx); }
         });
     }
 
@@ -360,9 +311,7 @@ impl AiVideoApp {
                 ui.label("输入");
                 let input_width = (ui.available_width() - 150.0).max(120.0);
                 ui.add_sized([input_width, 26.0], egui::TextEdit::singleline(&mut self.search_query).hint_text("输入文件名关键词，或输入想和 AI 讨论的问题"));
-                if ui.button("搜索").clicked() {
-                    self.search_current_database();
-                }
+                if ui.button("搜索").clicked() { self.search_current_database(); }
                 if ui.button("与 AI 对话").clicked() && !self.search_query.trim().is_empty() {
                     self.chat_log.push(format!("用户：{}", self.search_query.trim()));
                     self.chat_log.push("AI：当前为总览模式，后续将接入跨视频检索问答。".to_string());
@@ -421,12 +370,16 @@ impl AiVideoApp {
                     self.playback_position = 0.0;
                     self.playback_last_tick = None;
                 }
+                if ui.button("用 mpv 播放").clicked() {
+                    match crate::core::player::open_with_mpv(&video.path, self.playback_position) {
+                        Ok(()) => self.chat_log.push(format!("系统：已调用 mpv 播放 {}", video.name)),
+                        Err(err) => self.chat_log.push(format!("系统：mpv 启动失败：{err}")),
+                    }
+                }
                 let duration = video.duration.max(0.1);
                 let pos_label = format!("{} / {}", format_duration(self.playback_position), format_duration(video.duration));
                 let slider = egui::Slider::new(&mut self.playback_position, 0.0..=duration).show_value(false).text(pos_label);
-                if ui.add(slider).changed() {
-                    self.playback_last_tick = Some(Instant::now());
-                }
+                if ui.add(slider).changed() { self.playback_last_tick = Some(Instant::now()); }
             });
             ui.heading(&video.name);
             ui.label(format_duration(video.duration));
@@ -446,9 +399,7 @@ impl AiVideoApp {
         self.paint_thumbnail(ui, ctx, &video, thumb_rect);
         ui.painter().text(egui::pos2(rect.center().x, thumb_rect.max.y + 18.0), egui::Align2::CENTER_CENTER, &video.name, egui::TextStyle::Small.resolve(ui.style()), egui::Color32::from_gray(230));
         ui.painter().text(egui::pos2(rect.center().x, thumb_rect.max.y + 36.0), egui::Align2::CENTER_CENTER, format_duration(video.duration), egui::TextStyle::Small.resolve(ui.style()), egui::Color32::from_gray(165));
-        if response.clicked() {
-            self.select_video(idx);
-        }
+        if response.clicked() { self.select_video(idx); }
         ui.add_space(6.0);
     }
 
@@ -487,7 +438,7 @@ impl AiVideoApp {
 
     fn paint_thumbnail(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, video: &VideoMeta, rect: egui::Rect) {
         if let Some(texture) = self.ensure_thumbnail(ctx, video) {
-            ui.painter().image(texture.id(), rect, egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
+            paint_texture_fit(ui, &texture, rect);
         } else {
             ui.painter().rect_filled(rect, 4.0, egui::Color32::BLACK);
             ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "缩略图", egui::TextStyle::Small.resolve(ui.style()), egui::Color32::from_gray(170));
@@ -498,7 +449,7 @@ impl AiVideoApp {
         let frame_texture = self.ensure_playback_frame(ctx, video);
         let fallback_texture = if frame_texture.is_some() { None } else { self.ensure_thumbnail(ctx, video) };
         if let Some(texture) = frame_texture.or(fallback_texture) {
-            ui.painter().image(texture.id(), rect, egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
+            paint_texture_fit(ui, &texture, rect);
         } else {
             ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "视频播放预览区", egui::TextStyle::Heading.resolve(ui.style()), egui::Color32::from_gray(210));
         }
@@ -533,8 +484,7 @@ impl AiVideoApp {
         }
         let now = Instant::now();
         if let Some(last) = self.playback_last_tick {
-            let delta = now.saturating_duration_since(last).as_secs_f64();
-            self.playback_position += delta;
+            self.playback_position += now.saturating_duration_since(last).as_secs_f64();
         }
         self.playback_last_tick = Some(now);
         if let Some(video) = self.current_video() {
@@ -590,6 +540,21 @@ fn load_texture_from_path(ctx: &egui::Context, path: &str, key: &str) -> Result<
     Ok(ctx.load_texture(key.to_string(), color_image, egui::TextureOptions::LINEAR))
 }
 
+fn paint_texture_fit(ui: &egui::Ui, texture: &egui::TextureHandle, rect: egui::Rect) {
+    ui.painter().rect_filled(rect, 4.0, egui::Color32::BLACK);
+    let [tw, th] = texture.size();
+    if tw == 0 || th == 0 { return; }
+    let texture_aspect = tw as f32 / th as f32;
+    let rect_aspect = rect.width() / rect.height();
+    let draw_size = if texture_aspect > rect_aspect {
+        egui::vec2(rect.width(), rect.width() / texture_aspect)
+    } else {
+        egui::vec2(rect.height() * texture_aspect, rect.height())
+    };
+    let draw_rect = egui::Rect::from_center_size(rect.center(), draw_size);
+    ui.painter().image(texture.id(), draw_rect, egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
+}
+
 fn format_duration(seconds: f64) -> String {
     if seconds <= 0.0 { return "时长未知".to_string(); }
     let total = seconds.round() as u64;
@@ -599,11 +564,8 @@ fn format_duration(seconds: f64) -> String {
 }
 
 fn default_db_path() -> PathBuf { dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")).join("ai-video").join("ai-video.sqlite3") }
-
 fn nav_button(ui: &mut egui::Ui, label: &str) -> egui::Response { ui.add_sized([ui.available_width(), 36.0], egui::Button::new(label)) }
-
 fn panel_frame() -> egui::Frame { egui::Frame::default().fill(egui::Color32::from_gray(24)).stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(48))).inner_margin(egui::Margin::same(8)) }
-
 fn content_frame() -> egui::Frame { egui::Frame::default().fill(egui::Color32::from_gray(18)).inner_margin(egui::Margin::same(12)) }
 
 fn apply_gray_theme(ctx: &egui::Context) {
