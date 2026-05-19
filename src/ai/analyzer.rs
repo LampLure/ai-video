@@ -24,13 +24,11 @@ pub fn analyze_video(video: &VideoMeta, settings: &AppSettings, db_path: &Path) 
     prompt.push_str(&format!("文件名：{}\n", video.name));
     prompt.push_str(&format!("时长：{:.3}s，分辨率：{}x{}，fps：{:.3}\n", video.duration, video.width, video.height, video.fps));
     prompt.push_str(&format!("抽帧时间点：{:?}\n", frame_times));
-    prompt.push_str(&format!("图片文件：{}\n", frames.join(", ")));
-    prompt.push_str(&format!("音频文件：{}\n", audio.join(", ")));
     prompt.push_str("\n\n# 输出格式约束\n");
     prompt.push_str(&read_prompt(RESPONSE_SCHEMA_PROMPT));
 
     let client = AiClient::new(settings.llama_cpp_endpoint.clone(), settings.model_name.clone());
-    let raw = client.chat(vec![ChatMessage { role: "user".to_string(), content: prompt }], 0.1)?;
+    let raw = client.chat_multimodal("", &prompt, &frames, &audio, 0.1)?;
     let result = parse_analysis_result(&raw)?;
 
     let db = Database::open(db_path)?;
@@ -43,16 +41,9 @@ pub fn ask_video_question(video: &VideoMeta, question: &str, settings: &AppSetti
     let client = AiClient::new(settings.llama_cpp_endpoint.clone(), settings.model_name.clone());
     let first_prompt = format!(
         "{}\n\n# 当前视频\n视频名：{}\n视频路径：{}\n视频 hash：{}\n视频时长：{:.3}s\n最大图片数：{}\n最大音频段数：{}\n用户问题：{}",
-        read_prompt(VIDEO_QA_AGENT_PROMPT),
-        video.name,
-        video.path,
-        video.hash,
-        video.duration,
-        settings.max_images,
-        settings.max_audio_segments,
-        question
+        read_prompt(VIDEO_QA_AGENT_PROMPT), video.name, video.path, video.hash, video.duration, settings.max_images, settings.max_audio_segments, question
     );
-    let first = client.chat(vec![ChatMessage { role: "user".to_string(), content: first_prompt.clone() }], 0.2)?;
+    let first = client.chat_streaming(vec![ChatMessage { role: "user".to_string(), content: first_prompt.clone() }], 0.2)?;
 
     if let Ok(request) = serde_json::from_str::<AgentRequest>(&clean_model_output(&first)) {
         let limits = SegmentRequestLimits::from_settings(video.duration, settings);
@@ -60,28 +51,17 @@ pub fn ask_video_question(video: &VideoMeta, question: &str, settings: &AppSetti
         match response {
             AgentResponse::Ok { frames, audio } => {
                 let evidence_prompt = format!(
-                    "用户问题：{}\n\n程序已按你的 JSON 请求准备证据。请只根据这些证据和视频元数据回答。\n视频名：{}\n视频时长：{:.3}s\n图片文件：{}\n音频文件：{}\n\n请用中文简洁回答。如果证据不足，直接说明不足。",
-                    question,
-                    video.name,
-                    video.duration,
-                    frames.join(", "),
-                    audio.join(", ")
+                    "用户问题：{}\n\n程序已按你的 JSON 请求准备证据。请只根据这些证据和视频元数据回答。\n视频名：{}\n视频时长：{:.3}s\n请用中文简洁回答。如果证据不足，直接说明不足。",
+                    question, video.name, video.duration
                 );
-                return client.chat(
-                    vec![
-                        ChatMessage { role: "user".to_string(), content: first_prompt },
-                        ChatMessage { role: "assistant".to_string(), content: first },
-                        ChatMessage { role: "user".to_string(), content: evidence_prompt },
-                    ],
-                    0.2,
-                );
+                return client.chat_multimodal("", &evidence_prompt, &frames, &audio, 0.2);
             }
             AgentResponse::Error { code, message } => {
                 let repair_prompt = format!(
                     "你的上一条片段请求被程序拒绝。错误代码：{}。错误信息：{}。请在限制范围内重新请求更少数据，或者直接说明无法回答。用户问题：{}",
                     code, message, question
                 );
-                return client.chat(
+                return client.chat_streaming(
                     vec![
                         ChatMessage { role: "user".to_string(), content: first_prompt },
                         ChatMessage { role: "assistant".to_string(), content: first },
@@ -108,9 +88,7 @@ pub fn render_analysis_text(result: &AnalysisResult) -> String {
     if !result.tags.is_empty() { out.push_str(&format!("标签：{}\n", result.tags.join(" / "))); }
     if !result.scenes.is_empty() {
         out.push_str("场景：\n");
-        for scene in &result.scenes {
-            out.push_str(&format!("  {:.1}s-{:.1}s：{}\n", scene.start, scene.end, scene.description));
-        }
+        for scene in &result.scenes { out.push_str(&format!("  {:.1}s-{:.1}s：{}\n", scene.start, scene.end, scene.description)); }
     }
     out
 }
