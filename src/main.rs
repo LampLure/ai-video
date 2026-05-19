@@ -1,25 +1,17 @@
-#[cfg(feature = "desktop")]
-use ai_video::ui::commands::*;
+use ai_video::ui::app::AiVideoApp;
+use eframe::egui;
 
-#[cfg(feature = "desktop")]
-fn main() {
-    tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![
-            scan_videos,
-            get_default_settings,
-            save_settings,
-            init_database,
-            search_videos,
-            start_analysis_queue,
-            pause_analysis_queue,
-            ask_current_video,
-            prepare_video_segment
-        ])
-        .run(tauri::generate_context!())
-        .expect("failed to run ai-video application");
-}
+fn main() -> eframe::Result {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1280.0, 800.0])
+            .with_min_inner_size([800.0, 600.0]),
+        ..Default::default()
+    };
 
-#[cfg(not(feature = "desktop"))]
-fn main() {
-    println!("ai-video backend check build. Enable the desktop feature to run the Tauri app.");
+    eframe::run_native(
+        "AI Video",
+        options,
+        Box::new(|_cc| Ok(Box::new(AiVideoApp::default()))),
+    )
 }
