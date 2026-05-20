@@ -1,11 +1,14 @@
+use crate::ai::analyzer::{analyze_video_with_events, ask_video_question_with_events};
 use crate::ai::prompts;
-use crate::ai::{analyze_video, ask_video_question, render_analysis_text, AnalysisResult};
+use crate::ai::{analyze_video, render_analysis_text, AnalysisResult};
 use crate::core::cache_manager::{default_cache_root, enforce_cache_size_limit};
 use crate::core::config;
 use crate::core::settings::{AppSettings, CacheSwitchPolicy};
 use crate::core::video_manager::{hydrate_video_meta, scan_videos, VideoMeta};
 use crate::db::{Database, SearchResult};
 use crate::models;
+use crate::ui::status::{AiStatusState, QaEvent, STATUS_AI_ANALYZING, STATUS_AI_ANSWER_COMPLETE, STATUS_AI_ANSWERING, STATUS_AI_RECEIVED_USER_MESSAGE, STATUS_IDLE, STATUS_PROGRAM_REQUEST_OK};
+use crate::ui::status_panel::show_ai_status_panel;
 use eframe::egui;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -29,6 +32,7 @@ struct PendingModelCheck { due: Instant, kind: ModelCheckKind }
 
 #[derive(Debug)]
 enum AiEvent {
+    Status(String),
     Message(String),
     Select(usize),
     Completed { index: usize, name: String, result: AnalysisResult },
@@ -53,8 +57,10 @@ pub struct AiVideoApp {
     ai_paused: bool,
     ai_rx: Option<mpsc::Receiver<AiEvent>>,
     ai_cancel: Option<Arc<AtomicBool>>,
-    qa_rx: Option<mpsc::Receiver<String>>,
+    qa_rx: Option<mpsc::Receiver<QaEvent>>,
     qa_running: bool,
+    ai_status: AiStatusState,
+    qa_stream_index: Option<usize>,
     thumbnails: HashMap<String, egui::TextureHandle>,
     thumbnail_errors: HashMap<String, String>,
     playback_position: f64,
@@ -97,6 +103,8 @@ impl Default for AiVideoApp {
             ai_cancel: None,
             qa_rx: None,
             qa_running: false,
+            ai_status: AiStatusState::default(),
+            qa_stream_index: None,
             thumbnails: HashMap::new(),
             thumbnail_errors: HashMap::new(),
             playback_position: 0.0,
@@ -304,20 +312,24 @@ impl AiVideoApp {
         ui.separator();
         ui.horizontal_top(|ui| {
             egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.set_width(180.0);
-                ui.label(egui::RichText::new("设置导航").strong());
-                self.settings_nav_button(ui, SettingsSection::Model, "模型启动");
-                self.settings_nav_button(ui, SettingsSection::Prompts, "提示词/Agent");
-                self.settings_nav_button(ui, SettingsSection::AiLimits, "AI 限制");
-                self.settings_nav_button(ui, SettingsSection::Media, "媒体处理");
-                self.settings_nav_button(ui, SettingsSection::Cache, "缓存策略");
-                self.settings_nav_button(ui, SettingsSection::Debug, "调试模式");
-                ui.add_space(12.0);
-                if ui.button("保存设置").clicked() { self.save_settings_with_notice(); }
+                ui.set_width(176.0);
+                ui.vertical(|ui| {
+                    ui.label(egui::RichText::new("设置导航").strong());
+                    ui.add_space(6.0);
+                    self.settings_nav_button(ui, SettingsSection::Model, "模型启动");
+                    self.settings_nav_button(ui, SettingsSection::Prompts, "提示词/Agent");
+                    self.settings_nav_button(ui, SettingsSection::AiLimits, "AI 限制");
+                    self.settings_nav_button(ui, SettingsSection::Media, "媒体处理");
+                    self.settings_nav_button(ui, SettingsSection::Cache, "缓存策略");
+                    self.settings_nav_button(ui, SettingsSection::Debug, "调试模式");
+                    ui.add_space(16.0);
+                    if ui.add_sized([ui.available_width(), 30.0], egui::Button::new("保存设置")).clicked() { self.save_settings_with_notice(); }
+                });
             });
+            ui.add_space(12.0);
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                egui::Frame::group(ui.style()).show(ui, |ui| match self.settings_section {
+                ui.set_min_width((ui.available_width() - 8.0).max(360.0));
+                settings_card(ui, |ui| match self.settings_section {
                     SettingsSection::Model => self.settings_model(ui),
                     SettingsSection::Prompts => self.settings_prompts(ui),
                     SettingsSection::AiLimits => self.settings_ai_limits(ui),
@@ -331,26 +343,30 @@ impl AiVideoApp {
 
     fn settings_model(&mut self, ui: &mut egui::Ui) {
         ui.heading("模型启动");
+        ui.add_space(8.0);
         ui.label(format!("将 llama.cpp 启动脚本放到：{}", models::ensure_models_dir().display()));
+        ui.add_space(10.0);
         setting_text(ui, "接口", &mut self.settings.llama_cpp_endpoint);
         setting_text(ui, "模型名", &mut self.settings.model_name);
-        ui.add_space(8.0);
+        ui.add_space(12.0);
         self.model_panel(ui);
     }
 
     fn settings_prompts(&mut self, ui: &mut egui::Ui) {
         ui.heading("提示词 / Skill / Agent");
-        ui.label(format!("提示词目录：{}", prompts::ensure_prompt_files().display()));
         ui.add_space(8.0);
+        ui.label(format!("提示词目录：{}", prompts::ensure_prompt_files().display()));
+        ui.add_space(10.0);
         prompt_button(ui, "修改视频简介生成提示词", prompts::VIDEO_ANALYSIS_PROMPT, self);
         prompt_button(ui, "修改当前视频问答 Agent 限制文本", prompts::VIDEO_QA_AGENT_PROMPT, self);
         prompt_button(ui, "修改 AI 简介 JSON 输出格式", prompts::RESPONSE_SCHEMA_PROMPT, self);
-        ui.add_space(8.0);
+        ui.add_space(10.0);
         ui.label("修改并保存文档后，后续 AI 分析会读取新的提示词。已在运行中的单次请求不会被中途替换。 ");
     }
 
     fn settings_ai_limits(&mut self, ui: &mut egui::Ui) {
         ui.heading("AI 限制");
+        ui.add_space(8.0);
         setting_slider_usize(ui, "第一次分析发送图片数 / 请求图片上限", &mut self.settings.max_images, 1..=64);
         setting_slider_usize(ui, "音频段数上限", &mut self.settings.max_audio_segments, 0..=32);
         setting_slider_usize(ui, "最大上下文 token 长度", &mut self.settings.max_context_tokens, 1024..=65536);
@@ -358,6 +374,7 @@ impl AiVideoApp {
 
     fn settings_media(&mut self, ui: &mut egui::Ui) {
         ui.heading("媒体处理");
+        ui.add_space(8.0);
         setting_slider_f32(ui, "音频截取长度/s", &mut self.settings.audio_clip_seconds, 1.0..=30.0);
         setting_slider_u32(ui, "图片压缩总像素上限", &mut self.settings.image_pixel_limit, 1000..=100000);
         setting_slider_u32(ui, "音频采样率", &mut self.settings.audio_sample_rate, 8000..=48000);
@@ -365,17 +382,21 @@ impl AiVideoApp {
 
     fn settings_cache(&mut self, ui: &mut egui::Ui) {
         ui.heading("缓存策略");
+        ui.add_space(8.0);
         setting_slider_u64(ui, "缓存大小上限 / MB", &mut self.settings.cache_size_limit_mb, 128..=65536);
+        ui.add_space(8.0);
         ui.horizontal(|ui| {
             if ui.button("清理到大小上限").clicked() { self.clean_cache_to_limit(); }
             if ui.button("保存设置").clicked() { self.save_settings_with_notice(); }
         });
+        ui.add_space(8.0);
         ui.label(format!("缓存目录：{}", default_cache_root().display()));
         ui.label("程序会删除最旧缓存文件，直到总大小低于上限。 ");
     }
 
     fn settings_debug(&mut self, ui: &mut egui::Ui) {
         ui.heading("调试模式");
+        ui.add_space(8.0);
         ui.checkbox(&mut self.settings.debug_mode, "显示原始 JSON");
         ui.label("非调试模式下，聊天栏仅显示清洗后的文本。");
         ui.separator();
@@ -412,8 +433,18 @@ impl AiVideoApp {
     }
 
     fn bottom_chat(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| { ui.heading("AI 对话"); ui.separator(); let prompt_state = if self.ai_running { "后台分析中：输入禁用" } else if self.qa_running { "问答请求中" } else { "可提问当前视频" }; ui.label(prompt_state); });
-        let log_height = (ui.available_height() - 34.0).max(50.0);
+        ui.horizontal(|ui| {
+            ui.heading("AI 对话");
+            ui.separator();
+            let prompt_state = if self.ai_running { "后台分析中：输入禁用" } else if self.qa_running { "问答请求中" } else { "可提问当前视频" };
+            ui.label(prompt_state);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let can_refresh = !self.ai_running && !self.qa_running;
+                if ui.add_enabled(can_refresh, egui::Button::new("刷新对话")).clicked() { self.reset_chat_context(); }
+            });
+        });
+        show_ai_status_panel(ui, &self.ai_status);
+        let log_height = (ui.available_height() - 78.0).max(50.0);
         egui::ScrollArea::vertical().max_height(log_height).auto_shrink([false, false]).show(ui, |ui| {
             let keep_from = self.chat_log.len().saturating_sub(80);
             for line in &self.chat_log[keep_from..] { egui::Frame::group(ui.style()).show(ui, |ui| { ui.label(line); }); ui.add_space(4.0); }
@@ -513,7 +544,7 @@ impl AiVideoApp {
         if let Some(texture) = frame_texture.or(fallback_texture) { paint_texture_fit(ui, &texture, rect); } else { ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "视频播放预览区", egui::TextStyle::Heading.resolve(ui.style()), egui::Color32::from_gray(210)); }
     }
 
-    fn settings_nav_button(&mut self, ui: &mut egui::Ui, section: SettingsSection, label: &str) { if ui.selectable_label(self.settings_section == section, label).clicked() { self.settings_section = section; } }
+    fn settings_nav_button(&mut self, ui: &mut egui::Ui, section: SettingsSection, label: &str) { if ui.add_sized([ui.available_width(), 28.0], egui::SelectableLabel::new(self.settings_section == section, label)).clicked() { self.settings_section = section; } }
     fn filtered_video_indices(&self) -> Vec<usize> { let q = self.search_query.trim().to_ascii_lowercase(); self.videos.iter().enumerate().filter_map(|(idx, video)| if q.is_empty() || video.name.to_ascii_lowercase().contains(&q) { Some(idx) } else { None }).collect() }
     fn current_video(&self) -> Option<&VideoMeta> { self.selected_index.and_then(|idx| self.videos.get(idx)) }
 
@@ -524,8 +555,9 @@ impl AiVideoApp {
         self.folder = Some(folder.clone());
         self.scan_status = format!("正在扫描：{}", folder.display());
         self.thumbnails.clear(); self.thumbnail_errors.clear(); self.playback_frames.clear(); self.playback_frame_errors.clear(); self.search_results.clear();
+        self.ai_status.set("程序正在扫描文件夹");
         if matches!(self.settings.cache_switch_policy, CacheSwitchPolicy::ClearOnFolderChange) { let _ = crate::core::cache_manager::clear_cache(&default_cache_root()); }
-        match scan_videos(&folder.to_string_lossy()) { Ok(videos) => { self.videos = videos; self.selected_index = None; self.scan_status = format!("扫描完成：{} 个视频（缩略图懒加载）", self.videos.len()); self.persist_scanned_videos(); self.switch_mode(ScreenMode::Overview); } Err(err) => self.scan_status = format!("扫描失败：{err}"), }
+        match scan_videos(&folder.to_string_lossy()) { Ok(videos) => { self.videos = videos; self.selected_index = None; self.scan_status = format!("扫描完成：{} 个视频（缩略图懒加载）", self.videos.len()); self.persist_scanned_videos(); self.switch_mode(ScreenMode::Overview); self.ai_status.set("文件夹扫描完成，等待用户操作"); } Err(err) => { self.scan_status = format!("扫描失败：{err}"); self.ai_status.set("文件夹扫描失败"); } }
     }
 
     fn tick_playback(&mut self, ctx: &egui::Context) {
@@ -539,7 +571,7 @@ impl AiVideoApp {
 
     fn persist_scanned_videos(&mut self) { if let Ok(db) = Database::open(&self.db_path) { for video in &self.videos { let _ = db.upsert_video(video); } } }
     fn search_current_database(&mut self) { match Database::open(&self.db_path).and_then(|db| db.search(&self.search_query, 50)) { Ok(results) => self.search_results = results, Err(err) => self.chat_log.push(format!("搜索失败：{err}")), } }
-    fn generate_visible_thumbnails(&mut self) { self.chat_log.push("系统：缩略图已改为懒加载。滚动到哪里就生成哪里附近的缩略图。".to_string()); }
+    fn generate_visible_thumbnails(&mut self) { self.chat_log.push("系统：缩略图已改为懒加载。滚动到哪里就生成哪里附近的缩略图。".to_string()); self.ai_status.set("缩略图懒加载已启用"); }
 
     fn start_analysis_queue(&mut self) {
         if self.ai_running { return; }
@@ -553,6 +585,7 @@ impl AiVideoApp {
         let cancel_thread = cancel.clone();
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
+            let _ = tx.send(AiEvent::Status("程序启动 AI 分析队列".to_string()));
             let _ = tx.send(AiEvent::Message(format!("系统：从第 {} 个视频开始分析。", start + 1)));
             for (offset, video) in videos.into_iter().enumerate() {
                 if cancel_thread.load(Ordering::Relaxed) { let _ = tx.send(AiEvent::Message("系统：队列已暂停。".to_string())); break; }
@@ -560,28 +593,29 @@ impl AiVideoApp {
                 let _ = tx.send(AiEvent::Select(index));
                 let _ = tx.send(AiEvent::Message(format!("系统：开始分析 {}", video.name)));
                 let hydrated = hydrate_video_meta(&video).unwrap_or(video.clone());
-                match analyze_video(&hydrated, &settings, &db_path) {
+                match analyze_video_with_events(&hydrated, &settings, &db_path, |s| { let _ = tx.send(AiEvent::Status(s.to_string())); }, |_| {}) {
                     Ok(result) => { let _ = tx.send(AiEvent::Completed { index, name: hydrated.name.clone(), result }); }
                     Err(err) => { let _ = tx.send(AiEvent::Error { index, name: hydrated.name.clone(), error: err.to_string() }); }
                 }
             }
             let _ = tx.send(AiEvent::Finished);
         });
-        self.ai_rx = Some(rx); self.ai_cancel = Some(cancel); self.ai_running = true; self.ai_paused = false;
+        self.ai_rx = Some(rx); self.ai_cancel = Some(cancel); self.ai_running = true; self.ai_paused = false; self.ai_status.set("程序启动 AI 分析队列");
     }
 
-    fn pause_analysis_queue(&mut self) { if let Some(cancel) = &self.ai_cancel { cancel.store(true, Ordering::Relaxed); } self.ai_paused = true; self.chat_log.push("系统：已请求暂停。当前视频处理完成后停止队列。".to_string()); }
+    fn pause_analysis_queue(&mut self) { if let Some(cancel) = &self.ai_cancel { cancel.store(true, Ordering::Relaxed); } self.ai_paused = true; self.chat_log.push("系统：已请求暂停。当前视频处理完成后停止队列。".to_string()); self.ai_status.set("程序已请求暂停 AI 分析队列"); }
 
     fn poll_ai_events(&mut self, ctx: &egui::Context) {
         let Some(rx) = self.ai_rx.take() else { return; };
         let mut keep = true;
         while let Ok(event) = rx.try_recv() {
             match event {
+                AiEvent::Status(status) => self.ai_status.set(status),
                 AiEvent::Message(msg) => self.chat_log.push(msg),
                 AiEvent::Select(idx) => self.selected_index = Some(idx),
-                AiEvent::Completed { index, name, result } => { if let Some(v) = self.videos.get_mut(index) { if v.duration <= 0.0 { if let Ok(h) = hydrate_video_meta(v) { *v = h; } } } self.chat_log.push(format!("AI：已完成 {}\n{}", name, render_analysis_text(&result))); }
-                AiEvent::Error { index: _, name, error } => self.chat_log.push(format!("AI：分析 {} 失败：{}", name, error)),
-                AiEvent::Finished => { self.ai_running = false; self.ai_paused = false; self.ai_cancel = None; keep = false; self.chat_log.push("系统：AI 队列已结束。".to_string()); }
+                AiEvent::Completed { index, name, result } => { if let Some(v) = self.videos.get_mut(index) { if v.duration <= 0.0 { if let Ok(h) = hydrate_video_meta(v) { *v = h; } } } self.ai_status.set(format!("AI 完成视频分析：{}", name)); self.chat_log.push(format!("AI：已完成 {}\n{}", name, render_analysis_text(&result))); }
+                AiEvent::Error { index: _, name, error } => { self.ai_status.set(format!("AI 分析失败：{}", name)); self.chat_log.push(format!("AI：分析 {} 失败：{}", name, error)); }
+                AiEvent::Finished => { self.ai_running = false; self.ai_paused = false; self.ai_cancel = None; keep = false; self.chat_log.push("系统：AI 队列已结束。".to_string()); self.ai_status.set("AI 队列已结束"); }
             }
             ctx.request_repaint();
         }
@@ -592,18 +626,65 @@ impl AiVideoApp {
         let question = self.user_question.trim().to_string();
         self.user_question.clear();
         self.chat_log.push(format!("用户：{}", question));
+        self.ai_status.set(STATUS_AI_RECEIVED_USER_MESSAGE);
         let Some(video) = self.current_video().cloned() else { self.chat_log.push("系统：未选择视频。".to_string()); return; };
         let settings = self.settings.clone();
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
+            let _ = tx.send(QaEvent::Status(STATUS_AI_RECEIVED_USER_MESSAGE.to_string()));
             let hydrated = hydrate_video_meta(&video).unwrap_or(video);
-            let answer = ask_video_question(&hydrated, &question, &settings).unwrap_or_else(|err| format!("AI 问答失败：{}", err));
-            let _ = tx.send(answer);
+            let _ = tx.send(QaEvent::Status("程序发送视频时长和限制文本".to_string()));
+            let _ = tx.send(QaEvent::Status(STATUS_AI_ANALYZING.to_string()));
+            let answer = ask_video_question_with_events(
+                &hydrated,
+                &question,
+                &settings,
+                |status| { let _ = tx.send(QaEvent::Status(localize_ai_status(status))); },
+                |delta| { let _ = tx.send(QaEvent::Delta(delta.to_string())); },
+            );
+            match answer {
+                Ok(answer) => { let _ = tx.send(QaEvent::Answer(answer)); }
+                Err(err) => { let _ = tx.send(QaEvent::Error(format!("AI 问答失败：{}", err))); }
+            }
+            let _ = tx.send(QaEvent::Finished);
         });
         self.qa_rx = Some(rx); self.qa_running = true;
+        self.qa_stream_index = None;
     }
 
-    fn poll_qa_events(&mut self, ctx: &egui::Context) { if let Some(rx) = self.qa_rx.take() { match rx.try_recv() { Ok(answer) => { self.chat_log.push(format!("AI：{}", answer)); self.qa_running = false; ctx.request_repaint(); } Err(mpsc::TryRecvError::Empty) => { self.qa_rx = Some(rx); } Err(mpsc::TryRecvError::Disconnected) => { self.qa_running = false; self.chat_log.push("AI：问答线程已断开。".to_string()); } } } }
+    fn poll_qa_events(&mut self, ctx: &egui::Context) {
+        if let Some(rx) = self.qa_rx.take() {
+            let mut keep = true;
+            while let Ok(event) = rx.try_recv() {
+                match event {
+                    QaEvent::Status(status) => self.ai_status.set(status),
+                    QaEvent::Delta(delta) => {
+                        self.ai_status.set(STATUS_AI_ANSWERING);
+                        if self.qa_stream_index.is_none() { self.chat_log.push("AI：".to_string()); self.qa_stream_index = Some(self.chat_log.len() - 1); }
+                        if let Some(idx) = self.qa_stream_index { if let Some(line) = self.chat_log.get_mut(idx) { line.push_str(&delta); } }
+                    }
+                    QaEvent::Answer(answer) => {
+                        if self.qa_stream_index.is_none() { self.chat_log.push(format!("AI：{}", answer)); }
+                    }
+                    QaEvent::Error(error) => { self.chat_log.push(format!("AI：{}", error)); self.ai_status.set("AI 问答失败"); }
+                    QaEvent::Finished => { self.qa_running = false; keep = false; self.qa_stream_index = None; self.ai_status.set(STATUS_AI_ANSWER_COMPLETE); }
+                }
+                ctx.request_repaint();
+            }
+            if keep { self.qa_rx = Some(rx); }
+        }
+    }
+
+    fn reset_chat_context(&mut self) {
+        self.chat_log.clear();
+        self.chat_log.push("系统：已刷新对话，上下文已清空。".to_string());
+        self.user_question.clear();
+        self.qa_rx = None;
+        self.qa_running = false;
+        self.qa_stream_index = None;
+        self.ai_status = AiStatusState::default();
+        self.ai_status.set("对话上下文已刷新");
+    }
 
     fn refresh_model_scripts(&mut self) { self.model_scripts = models::list_model_scripts(); if self.selected_model_script.is_none() || self.selected_model_script.as_ref().is_some_and(|p| !p.exists()) { self.selected_model_script = self.model_scripts.first().cloned(); } self.model_status = format!("发现 {} 个启动文件。", self.model_scripts.len()); }
     fn start_selected_model(&mut self) { if self.model_child.is_some() { self.show_notice("模型已在运行", "本程序已经记录了一个模型进程，请先终止后再启动。".to_string()); return; } if self.has_pending_model_check(ModelCheckKind::Start) { self.show_notice("正在检测", "模型启动检测尚未完成，请不要重复点击启动。".to_string()); return; } if models::is_llama_service_ready(Duration::from_millis(250)) { self.model_status = "7080 服务已经可用，未重复启动脚本。".to_string(); self.show_notice("模型服务已可用", "检测到 127.0.0.1:7080 已经可连接，因此没有再次启动脚本。".to_string()); return; } let Some(script) = self.selected_model_script.clone() else { self.show_notice("未选择启动文件", format!("请将 .bat/.cmd 或 .sh 放入 {}，然后点击刷新。", models::ensure_models_dir().display())); return; }; self.settings.model_name = script.file_stem().and_then(|s| s.to_str()).unwrap_or("local-llamacpp").to_string(); match models::start_model_script(&script) { Ok(child) => { let pid = child.id(); self.model_child = Some(child); self.model_status = format!("已启动 PID {}，最多等待 10 秒检测 7080。", pid); self.pending_model_check = Some(PendingModelCheck { due: Instant::now() + Duration::from_secs(10), kind: ModelCheckKind::Start }); self.show_notice("已发送启动命令", format!("已启动脚本：{}\n进程 PID：{}\n程序会在 10 秒内持续检测 127.0.0.1:7080 是否可用。", script.display(), pid)); } Err(err) => { self.model_status = err.clone(); self.show_notice("启动失败", err); } } }
@@ -624,11 +705,13 @@ fn load_texture_from_path(ctx: &egui::Context, path: &str, key: &str) -> Result<
 fn paint_texture_fit(ui: &egui::Ui, texture: &egui::TextureHandle, rect: egui::Rect) { ui.painter().rect_filled(rect, 4.0, egui::Color32::BLACK); let [tw, th] = texture.size(); if tw == 0 || th == 0 { return; } let texture_aspect = tw as f32 / th as f32; let rect_aspect = rect.width() / rect.height(); let draw_size = if texture_aspect > rect_aspect { egui::vec2(rect.width(), rect.width() / texture_aspect) } else { egui::vec2(rect.height() * texture_aspect, rect.height()) }; let draw_rect = egui::Rect::from_center_size(rect.center(), draw_size); ui.painter().image(texture.id(), draw_rect, egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)), egui::Color32::WHITE); }
 fn format_duration(seconds: f64) -> String { if seconds <= 0.0 { return "时长未知".to_string(); } let total = seconds.round() as u64; let mins = total / 60; let secs = total % 60; format!("{mins}:{secs:02}") }
 fn elide_middle(text: &str, max_chars: usize) -> String { let count = text.chars().count(); if count <= max_chars { return text.to_string(); } if max_chars <= 3 { return "...".to_string(); } let keep = max_chars - 3; let left = keep / 2; let right = keep - left; let start: String = text.chars().take(left).collect(); let end: String = text.chars().rev().take(right).collect::<String>().chars().rev().collect(); format!("{start}...{end}") }
-fn setting_text(ui: &mut egui::Ui, label: &str, value: &mut String) { ui.vertical(|ui| { ui.label(label); ui.add_sized([ui.available_width().min(560.0), 24.0], egui::TextEdit::singleline(value)); }); ui.add_space(8.0); }
-fn setting_slider_usize(ui: &mut egui::Ui, label: &str, value: &mut usize, range: std::ops::RangeInclusive<usize>) { ui.vertical(|ui| { ui.label(label); ui.add_sized([ui.available_width().min(560.0), 24.0], egui::Slider::new(value, range)); }); ui.add_space(8.0); }
-fn setting_slider_u32(ui: &mut egui::Ui, label: &str, value: &mut u32, range: std::ops::RangeInclusive<u32>) { ui.vertical(|ui| { ui.label(label); ui.add_sized([ui.available_width().min(560.0), 24.0], egui::Slider::new(value, range)); }); ui.add_space(8.0); }
-fn setting_slider_u64(ui: &mut egui::Ui, label: &str, value: &mut u64, range: std::ops::RangeInclusive<u64>) { ui.vertical(|ui| { ui.label(label); ui.add_sized([ui.available_width().min(560.0), 24.0], egui::Slider::new(value, range)); }); ui.add_space(8.0); }
-fn setting_slider_f32(ui: &mut egui::Ui, label: &str, value: &mut f32, range: std::ops::RangeInclusive<f32>) { ui.vertical(|ui| { ui.label(label); ui.add_sized([ui.available_width().min(560.0), 24.0], egui::Slider::new(value, range)); }); ui.add_space(8.0); }
+fn setting_text(ui: &mut egui::Ui, label: &str, value: &mut String) { ui.vertical(|ui| { ui.label(label); ui.add_sized([ui.available_width().min(560.0), 24.0], egui::TextEdit::singleline(value)); }); ui.add_space(12.0); }
+fn setting_slider_usize(ui: &mut egui::Ui, label: &str, value: &mut usize, range: std::ops::RangeInclusive<usize>) { ui.vertical(|ui| { ui.label(label); ui.add_sized([ui.available_width().min(560.0), 24.0], egui::Slider::new(value, range)); }); ui.add_space(12.0); }
+fn setting_slider_u32(ui: &mut egui::Ui, label: &str, value: &mut u32, range: std::ops::RangeInclusive<u32>) { ui.vertical(|ui| { ui.label(label); ui.add_sized([ui.available_width().min(560.0), 24.0], egui::Slider::new(value, range)); }); ui.add_space(12.0); }
+fn setting_slider_u64(ui: &mut egui::Ui, label: &str, value: &mut u64, range: std::ops::RangeInclusive<u64>) { ui.vertical(|ui| { ui.label(label); ui.add_sized([ui.available_width().min(560.0), 24.0], egui::Slider::new(value, range)); }); ui.add_space(12.0); }
+fn setting_slider_f32(ui: &mut egui::Ui, label: &str, value: &mut f32, range: std::ops::RangeInclusive<f32>) { ui.vertical(|ui| { ui.label(label); ui.add_sized([ui.available_width().min(560.0), 24.0], egui::Slider::new(value, range)); }); ui.add_space(12.0); }
+fn settings_card(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) { egui::Frame::group(ui.style()).inner_margin(egui::Margin::same(14)).show(ui, |ui| { ui.set_width(ui.available_width()); ui.vertical(add_contents); }); }
+fn localize_ai_status(status: &str) -> String { match status { "AI received user question" => STATUS_AI_RECEIVED_USER_MESSAGE.to_string(), "program sent video metadata and limits to AI" => "程序发送视频时长和限制文本".to_string(), "AI requested video evidence from program" => "AI 向程序请求视频片段".to_string(), "program prepared requested video evidence" => STATUS_PROGRAM_REQUEST_OK.to_string(), "program sent evidence to AI" => "程序将视频片段发送给 AI".to_string(), "AI answer complete" => STATUS_AI_ANSWER_COMPLETE.to_string(), "AI answered without requesting program evidence" => "AI 未请求片段，直接回答".to_string(), other => other.to_string() } }
 fn default_db_path() -> PathBuf { dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")).join("ai-video").join("ai-video.sqlite3") }
 fn nav_button(ui: &mut egui::Ui, label: &str) -> egui::Response { ui.add_sized([ui.available_width(), 36.0], egui::Button::new(label)) }
 fn panel_frame() -> egui::Frame { egui::Frame::default().fill(egui::Color32::from_gray(24)).stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(48))).inner_margin(egui::Margin::same(8)) }
