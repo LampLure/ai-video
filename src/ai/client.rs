@@ -49,6 +49,19 @@ impl AiClient {
         self.post_chat_streaming(body)
     }
 
+    pub fn chat_streaming_with_callback<F>(&self, messages: Vec<ChatMessage>, temperature: f32, mut on_delta: F) -> Result<String>
+    where
+        F: FnMut(&str) + Send,
+    {
+        let body = json!({
+            "model": self.model_name,
+            "messages": messages,
+            "temperature": temperature,
+            "stream": true
+        });
+        self.post_chat_streaming_with_callback(body, |delta| on_delta(delta))
+    }
+
     pub fn chat_multimodal(&self, system_prompt: &str, user_text: &str, image_paths: &[String], audio_paths: &[String], temperature: f32) -> Result<String> {
         let mut content = Vec::new();
         if !system_prompt.trim().is_empty() {
@@ -81,6 +94,41 @@ impl AiClient {
         self.post_chat_streaming(body)
     }
 
+    pub fn chat_multimodal_with_callback<F>(&self, system_prompt: &str, user_text: &str, image_paths: &[String], audio_paths: &[String], temperature: f32, mut on_delta: F) -> Result<String>
+    where
+        F: FnMut(&str) + Send,
+    {
+        let mut content = Vec::new();
+        if !system_prompt.trim().is_empty() {
+            content.push(json!({ "type": "text", "text": system_prompt }));
+        }
+        content.push(json!({ "type": "text", "text": user_text }));
+        for path in image_paths {
+            let data = std::fs::read(path).with_context(|| format!("failed to read image for AI: {path}"))?;
+            let b64 = general_purpose::STANDARD.encode(data);
+            content.push(json!({
+                "type": "image_url",
+                "image_url": { "url": format!("data:image/jpeg;base64,{b64}") }
+            }));
+        }
+        for path in audio_paths {
+            let data = std::fs::read(path).with_context(|| format!("failed to read audio for AI: {path}"))?;
+            let b64 = general_purpose::STANDARD.encode(data);
+            content.push(json!({
+                "type": "input_audio",
+                "input_audio": { "data": b64, "format": "wav" }
+            }));
+        }
+        let body = json!({
+            "model": self.model_name,
+            "messages": [{ "role": "user", "content": content }],
+            "temperature": temperature,
+            "max_tokens": 1600,
+            "stream": true
+        });
+        self.post_chat_streaming_with_callback(body, |delta| on_delta(delta))
+    }
+
     fn post_chat(&self, body: Value) -> Result<String> {
         let value: Value = self.http.post(&self.endpoint).json(&body).send()?.error_for_status()?.json()?;
         let content = value["choices"][0]["message"]["content"].as_str().unwrap_or_default().to_string();
@@ -88,6 +136,13 @@ impl AiClient {
     }
 
     fn post_chat_streaming(&self, body: Value) -> Result<String> {
+        self.post_chat_streaming_with_callback(body, |_| {})
+    }
+
+    fn post_chat_streaming_with_callback<F>(&self, body: Value, mut on_delta: F) -> Result<String>
+    where
+        F: FnMut(&str),
+    {
         let response = self.http.post(&self.endpoint).json(&body).send()?.error_for_status()?;
         let reader = BufReader::new(response);
         let mut out = String::new();
@@ -100,8 +155,10 @@ impl AiClient {
             let Ok(value) = serde_json::from_str::<Value>(data) else { continue; };
             if let Some(s) = value.pointer("/choices/0/delta/content").and_then(Value::as_str) {
                 out.push_str(s);
+                on_delta(s);
             } else if let Some(s) = value.pointer("/choices/0/message/content").and_then(Value::as_str) {
                 out.push_str(s);
+                on_delta(s);
             }
         }
         if out.trim().is_empty() {
