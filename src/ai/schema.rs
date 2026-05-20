@@ -15,6 +15,7 @@ pub struct QualitySummary {
     pub blur: Option<String>,
     pub distortion: Option<String>,
     pub brightness: Option<String>,
+    #[serde(default)]
     pub extra: BTreeMap<String, serde_json::Value>,
 }
 
@@ -24,6 +25,7 @@ pub struct AudioSummary {
     pub speech: Option<String>,
     pub music: Option<String>,
     pub noise: Option<String>,
+    #[serde(default)]
     pub extra: BTreeMap<String, serde_json::Value>,
 }
 
