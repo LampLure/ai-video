@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -81,6 +81,8 @@ pub struct AiVideoApp {
     debug_log: Vec<String>,
     debug_follow: bool,
     debug_follow_blocked_until: Option<Instant>,
+    pending_folder: Arc<Mutex<Option<PathBuf>>>,
+    initialized: bool,
 }
 
 impl Default for AiVideoApp {
@@ -128,12 +130,26 @@ impl Default for AiVideoApp {
             debug_log: Vec::new(),
             debug_follow: true,
             debug_follow_blocked_until: None,
+            pending_folder: Arc::new(Mutex::new(None)),
+            initialized: false,
         }
     }
 }
 
 impl eframe::App for AiVideoApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if !self.initialized {
+            self.initialized = true;
+            if let Some(ref last) = self.settings.last_folder {
+                let p = PathBuf::from(last);
+                if p.exists() { let _ = self.pending_folder.lock().map(|mut pf| *pf = Some(p)); }
+            }
+        }
+        if let Ok(mut pending) = self.pending_folder.lock() {
+            if let Some(folder) = pending.take() {
+                self.open_folder(folder);
+            }
+        }
         apply_gray_theme(ctx);
         self.tick_playback(ctx);
         self.poll_model_process();
@@ -195,7 +211,11 @@ impl AiVideoApp {
         ui.heading("控制面板");
         ui.separator();
         if nav_button(ui, "选择文件夹").clicked() {
-            if let Some(folder) = rfd::FileDialog::new().pick_folder() { self.open_folder(folder); }
+            let pending = self.pending_folder.clone();
+            std::thread::spawn(move || {
+                let folder = rfd::FileDialog::new().pick_folder();
+                if let Ok(mut p) = pending.lock() { *p = folder; }
+            });
         }
         if nav_button(ui, "分析文件/生成缩略图").clicked() { self.generate_visible_thumbnails(); }
         egui::Frame::group(ui.style()).show(ui, |ui| self.model_panel(ui));
@@ -567,6 +587,8 @@ impl AiVideoApp {
     fn switch_mode(&mut self, mode: ScreenMode) { self.mode = mode; if self.mode == ScreenMode::Overview { self.bottom_panel_height = self.bottom_panel_height.min(120.0).max(64.0); } else if matches!(self.mode, ScreenMode::Playback | ScreenMode::AiAnalysis) && self.bottom_panel_height < 180.0 { self.bottom_panel_height = 240.0; } }
 
     fn open_folder(&mut self, folder: PathBuf) {
+        self.settings.last_folder = Some(folder.to_string_lossy().to_string());
+        let _ = config::save_settings(&self.settings);
         self.folder = Some(folder.clone());
         self.scan_status = format!("正在扫描：{}", folder.display());
         self.thumbnails.clear(); self.thumbnail_errors.clear(); self.playback_frames.clear(); self.playback_frame_errors.clear(); self.search_results.clear();

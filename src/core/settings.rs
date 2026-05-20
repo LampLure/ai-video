@@ -19,6 +19,7 @@ pub struct AppSettings {
     pub debug_mode: bool,
     pub llama_cpp_endpoint: String,
     pub model_name: String,
+    pub last_folder: Option<String>,
 }
 
 impl Default for AppSettings {
@@ -35,6 +36,7 @@ impl Default for AppSettings {
             debug_mode: false,
             llama_cpp_endpoint: "http://127.0.0.1:7080/v1/chat/completions".to_string(),
             model_name: "local-multimodal".to_string(),
+            last_folder: None,
         }
     }
 }
