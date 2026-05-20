@@ -95,6 +95,7 @@ impl AiStatusState {
 #[derive(Debug)]
 pub enum QaEvent {
     Status(String),
+    Debug(String),
     Delta(String),
     Answer(String),
     Error(String),
@@ -104,6 +105,7 @@ pub enum QaEvent {
 #[derive(Debug)]
 pub enum AiUiEvent {
     Status(String),
+    Debug(String),
     Delta(String),
     Message(String),
     Finished,

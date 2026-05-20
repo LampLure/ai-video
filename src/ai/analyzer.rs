@@ -27,16 +27,12 @@ where
 
     on_status("程序正在执行视频抽帧");
     let frames = extract_frames(&video.path, &video.hash, &frame_times, settings.image_pixel_limit)?;
-    for path in &frames {
-        on_status(&format!("debug:\u{1F5BC} {}", path));
-    }
-
-    on_status("程序正在执行音频切割");
+    for f in &frames { on_status(&format!("debug:🖼 {}", f)); }
     let mut audio = Vec::new();
     for center in &audio_centers {
-        let path = extract_audio_segment(&video.path, &video.hash, *center, settings.audio_clip_seconds, settings.audio_sample_rate)?;
-        on_status(&format!("debug:\u{1F3A7} {}", path));
-        audio.push(path);
+        let seg = extract_audio_segment(&video.path, &video.hash, *center, settings.audio_clip_seconds, settings.audio_sample_rate)?;
+        on_status(&format!("debug:🎧 {}", seg));
+        audio.push(seg);
     }
 
     on_status("程序正在构造视频简介提示词");
@@ -52,7 +48,11 @@ where
 
     on_status("程序正在发送多模态简介请求");
     let client = AiClient::new(settings.llama_cpp_endpoint.clone(), settings.model_name.clone());
-    let raw = client.chat_multimodal_with_callback("", &prompt, &frames, &audio, 0.1, |delta| on_delta(delta))?;
+    let raw = client.chat_multimodal_with_callback("", &prompt, &frames, &audio, 0.1, |delta| on_delta(delta))
+        .map_err(|e| {
+            on_status(&format!("debug:AI 请求失败: {e}"));
+            e
+        })?;
     on_status("程序已收到 AI 简介响应，正在解析 JSON");
     let result = parse_analysis_result(&raw)?;
 
@@ -93,12 +93,8 @@ where
         match response {
             AgentResponse::Ok { frames, audio } => {
                 on_status("程序已完成 AI 请求的视频片段处理");
-                for path in &frames {
-                    on_status(&format!("debug:\u{1F5BC} {}", path));
-                }
-                for path in &audio {
-                    on_status(&format!("debug:\u{1F3A7} {}", path));
-                }
+                for f in &frames { on_status(&format!("debug:🖼 {}", f)); }
+                for a in &audio { on_status(&format!("debug:🎧 {}", a)); }
                 let evidence_prompt = format!(
                     "用户问题：{}\n\n程序已按你的 JSON 请求准备证据。请只根据这些证据和视频元数据回答。\n视频名：{}\n视频时长：{:.3}s\n请用中文简洁回答。如果证据不足，直接说明不足。",
                     question, video.name, video.duration
@@ -137,7 +133,18 @@ where
 
 pub fn parse_analysis_result(raw: &str) -> Result<AnalysisResult> {
     let cleaned = clean_model_output(raw);
-    serde_json::from_str(&cleaned).with_context(|| format!("AI 返回了无效的简介 JSON：{cleaned}"))
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("AI 返回了空内容，无法解析为 JSON");
+    }
+    let result: Result<AnalysisResult, _> = serde_json::from_str(trimmed);
+    match result {
+        Ok(r) => Ok(r),
+        Err(err) => {
+            let snippet = if trimmed.len() > 300 { format!("{}...", &trimmed[..300]) } else { trimmed.to_string() };
+            anyhow::bail!("AI 返回了无效的简介 JSON(serde 错误: {err})\n内容(前300字符): {snippet}")
+        }
+    }
 }
 
 pub fn render_analysis_text(result: &AnalysisResult) -> String {
@@ -154,7 +161,9 @@ pub fn render_analysis_text(result: &AnalysisResult) -> String {
 
 pub fn uniform_timestamps(duration: f64, count: usize) -> Vec<f64> {
     if count == 0 || duration <= 0.0 { return Vec::new(); }
-    if count == 1 { return vec![(duration * 0.5).max(0.0)]; }
-    let end = duration.max(0.1);
+    let safe_duration = duration.max(0.1);
+    if count == 1 { return vec![(safe_duration * 0.5).min(safe_duration - 0.5).max(0.0)]; }
+    let guard = 0.5_f64.min(safe_duration * 0.02);
+    let end = (safe_duration - guard).max(0.0);
     (0..count).map(|idx| (idx as f64 / (count - 1) as f64) * end).collect()
 }

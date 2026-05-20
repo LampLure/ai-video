@@ -1,13 +1,13 @@
 use crate::ai::analyzer::{analyze_video_with_events, ask_video_question_with_events};
 use crate::ai::prompts;
-use crate::ai::{analyze_video, render_analysis_text, AnalysisResult};
+use crate::ai::{render_analysis_text, AnalysisResult};
 use crate::core::cache_manager::{default_cache_root, enforce_cache_size_limit};
 use crate::core::config;
 use crate::core::settings::{AppSettings, CacheSwitchPolicy};
 use crate::core::video_manager::{hydrate_video_meta, scan_videos, VideoMeta};
 use crate::db::{Database, SearchResult};
 use crate::models;
-use crate::ui::status::{AiStatusState, QaEvent, STATUS_AI_ANALYZING, STATUS_AI_ANSWER_COMPLETE, STATUS_AI_ANSWERING, STATUS_AI_RECEIVED_USER_MESSAGE, STATUS_IDLE, STATUS_PROGRAM_REQUEST_OK};
+use crate::ui::status::{AiStatusState, QaEvent, STATUS_AI_ANALYZING, STATUS_AI_ANSWER_COMPLETE, STATUS_AI_ANSWERING, STATUS_AI_RECEIVED_USER_MESSAGE, STATUS_PROGRAM_REQUEST_OK};
 use crate::ui::status_panel::show_ai_status_panel;
 use eframe::egui;
 use std::collections::HashMap;
@@ -33,6 +33,7 @@ struct PendingModelCheck { due: Instant, kind: ModelCheckKind }
 #[derive(Debug)]
 enum AiEvent {
     Status(String),
+    Debug(String),
     Message(String),
     Select(usize),
     Completed { index: usize, name: String, result: AnalysisResult },
@@ -77,6 +78,9 @@ pub struct AiVideoApp {
     model_notice_title: String,
     model_notice_body: String,
     bottom_panel_height: f32,
+    debug_log: Vec<String>,
+    debug_follow: bool,
+    debug_follow_blocked_until: Option<Instant>,
 }
 
 impl Default for AiVideoApp {
@@ -121,6 +125,9 @@ impl Default for AiVideoApp {
             model_notice_title: String::new(),
             model_notice_body: String::new(),
             bottom_panel_height: 86.0,
+            debug_log: Vec::new(),
+            debug_follow: true,
+            debug_follow_blocked_until: None,
         }
     }
 }
@@ -134,6 +141,7 @@ impl eframe::App for AiVideoApp {
         self.poll_ai_events(ctx);
         self.poll_qa_events(ctx);
         self.show_model_notice(ctx);
+        self.show_debug_window(ctx);
 
         egui::TopBottomPanel::top("top_bar").frame(panel_frame()).show(ctx, |ui| self.top_bar(ui));
         egui::SidePanel::left("control_panel")
@@ -576,6 +584,7 @@ impl AiVideoApp {
     fn start_analysis_queue(&mut self) {
         if self.ai_running { return; }
         if self.videos.is_empty() { self.chat_log.push("系统：没有可分析的视频。".to_string()); return; }
+        self.debug_log.push(format!("启动分析队列，共 {} 个视频", self.videos.len().saturating_sub(self.selected_index.unwrap_or(0))));
         let start = self.selected_index.unwrap_or(0);
         self.selected_index = Some(start);
         let videos: Vec<VideoMeta> = self.videos.iter().skip(start).cloned().collect();
@@ -585,17 +594,29 @@ impl AiVideoApp {
         let cancel_thread = cancel.clone();
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
+            let settings = settings;
             let _ = tx.send(AiEvent::Status("程序启动 AI 分析队列".to_string()));
+            let _ = tx.send(AiEvent::Debug("AI 分析队列已启动".to_string()));
             let _ = tx.send(AiEvent::Message(format!("系统：从第 {} 个视频开始分析。", start + 1)));
             for (offset, video) in videos.into_iter().enumerate() {
                 if cancel_thread.load(Ordering::Relaxed) { let _ = tx.send(AiEvent::Message("系统：队列已暂停。".to_string())); break; }
                 let index = start + offset;
                 let _ = tx.send(AiEvent::Select(index));
+                let _ = tx.send(AiEvent::Debug(format!("开始分析: {} (hash={}, duration={:.3}s)", video.name, video.hash, video.duration)));
                 let _ = tx.send(AiEvent::Message(format!("系统：开始分析 {}", video.name)));
                 let hydrated = hydrate_video_meta(&video).unwrap_or(video.clone());
+                if hydrated.duration <= 0.0 { let _ = tx.send(AiEvent::Error { index, name: hydrated.name.clone(), error: "无法读取视频时长，跳过".to_string() }); continue; }
+                let min_frames = settings.max_images.min(3).max(1);
+                if hydrated.duration < min_frames as f64 * 0.5 { let _ = tx.send(AiEvent::Error { index, name: hydrated.name.clone(), error: format!("视频时长 {:.2}s 太短，跳过", hydrated.duration) }); continue; }
                 match analyze_video_with_events(&hydrated, &settings, &db_path, |s| { let _ = tx.send(AiEvent::Status(s.to_string())); }, |_| {}) {
-                    Ok(result) => { let _ = tx.send(AiEvent::Completed { index, name: hydrated.name.clone(), result }); }
-                    Err(err) => { let _ = tx.send(AiEvent::Error { index, name: hydrated.name.clone(), error: err.to_string() }); }
+                    Ok(result) => {
+                        let _ = tx.send(AiEvent::Debug(format!("分析完成: {}", hydrated.name)));
+                        let _ = tx.send(AiEvent::Completed { index, name: hydrated.name.clone(), result });
+                    }
+                    Err(err) => {
+                        let _ = tx.send(AiEvent::Debug(format!("分析失败: {} - {}", hydrated.name, err)));
+                        let _ = tx.send(AiEvent::Error { index, name: hydrated.name.clone(), error: err.to_string() });
+                    }
                 }
             }
             let _ = tx.send(AiEvent::Finished);
@@ -610,7 +631,14 @@ impl AiVideoApp {
         let mut keep = true;
         while let Ok(event) = rx.try_recv() {
             match event {
-                AiEvent::Status(status) => self.ai_status.set(status),
+                AiEvent::Status(status) => {
+                    if let Some(debug) = status.strip_prefix("debug:") {
+                        if self.settings.debug_mode { self.debug_log.push(debug.to_string()); }
+                    } else {
+                        self.ai_status.set(status);
+                    }
+                }
+                AiEvent::Debug(msg) => { if self.settings.debug_mode { self.debug_log.push(msg); } }
                 AiEvent::Message(msg) => self.chat_log.push(msg),
                 AiEvent::Select(idx) => self.selected_index = Some(idx),
                 AiEvent::Completed { index, name, result } => { if let Some(v) = self.videos.get_mut(index) { if v.duration <= 0.0 { if let Ok(h) = hydrate_video_meta(v) { *v = h; } } } self.ai_status.set(format!("AI 完成视频分析：{}", name)); self.chat_log.push(format!("AI：已完成 {}\n{}", name, render_analysis_text(&result))); }
@@ -626,6 +654,7 @@ impl AiVideoApp {
         let question = self.user_question.trim().to_string();
         self.user_question.clear();
         self.chat_log.push(format!("用户：{}", question));
+        self.debug_log.push(format!("用户消息: {}", question));
         self.ai_status.set(STATUS_AI_RECEIVED_USER_MESSAGE);
         let Some(video) = self.current_video().cloned() else { self.chat_log.push("系统：未选择视频。".to_string()); return; };
         let settings = self.settings.clone();
@@ -634,6 +663,7 @@ impl AiVideoApp {
             let _ = tx.send(QaEvent::Status(STATUS_AI_RECEIVED_USER_MESSAGE.to_string()));
             let hydrated = hydrate_video_meta(&video).unwrap_or(video);
             let _ = tx.send(QaEvent::Status("程序发送视频时长和限制文本".to_string()));
+            let _ = tx.send(QaEvent::Debug(format!("视频: {} (时长 {:.3}s, {}x{} @ {:.1}fps)", hydrated.name, hydrated.duration, hydrated.width, hydrated.height, hydrated.fps)));
             let _ = tx.send(QaEvent::Status(STATUS_AI_ANALYZING.to_string()));
             let answer = ask_video_question_with_events(
                 &hydrated,
@@ -643,8 +673,14 @@ impl AiVideoApp {
                 |delta| { let _ = tx.send(QaEvent::Delta(delta.to_string())); },
             );
             match answer {
-                Ok(answer) => { let _ = tx.send(QaEvent::Answer(answer)); }
-                Err(err) => { let _ = tx.send(QaEvent::Error(format!("AI 问答失败：{}", err))); }
+                Ok(answer) => {
+                    let _ = tx.send(QaEvent::Debug(format!("AI 回答 ({} 字符): {}", answer.chars().count(), if answer.len() > 200 { format!("{}...", &answer[..200]) } else { answer.clone() })));
+                    let _ = tx.send(QaEvent::Answer(answer));
+                }
+                Err(err) => {
+                    let _ = tx.send(QaEvent::Debug(format!("AI 回答失败: {err}")));
+                    let _ = tx.send(QaEvent::Error(format!("AI 问答失败：{}", err)));
+                }
             }
             let _ = tx.send(QaEvent::Finished);
         });
@@ -657,7 +693,14 @@ impl AiVideoApp {
             let mut keep = true;
             while let Ok(event) = rx.try_recv() {
                 match event {
-                    QaEvent::Status(status) => self.ai_status.set(status),
+                    QaEvent::Status(status) => {
+                        if let Some(debug) = status.strip_prefix("debug:") {
+                            if self.settings.debug_mode { self.debug_log.push(debug.to_string()); }
+                        } else {
+                            self.ai_status.set(status);
+                        }
+                    }
+                    QaEvent::Debug(msg) => { if self.settings.debug_mode { self.debug_log.push(msg); } }
                     QaEvent::Delta(delta) => {
                         self.ai_status.set(STATUS_AI_ANSWERING);
                         if self.qa_stream_index.is_none() { self.chat_log.push("AI：".to_string()); self.qa_stream_index = Some(self.chat_log.len() - 1); }
@@ -684,6 +727,47 @@ impl AiVideoApp {
         self.qa_stream_index = None;
         self.ai_status = AiStatusState::default();
         self.ai_status.set("对话上下文已刷新");
+        self.debug_log.clear();
+        self.debug_follow = true;
+        self.debug_follow_blocked_until = None;
+    }
+
+    fn show_debug_window(&mut self, ctx: &egui::Context) {
+        if !self.settings.debug_mode { return; }
+        if self.debug_log.len() > 1000 {
+            self.debug_log.drain(0..(self.debug_log.len() - 1000));
+        }
+        let now = Instant::now();
+        if let Some(until) = self.debug_follow_blocked_until {
+            if now >= until { self.debug_follow = true; self.debug_follow_blocked_until = None; }
+        }
+        let window_response = egui::Window::new("🧪 调试日志").resizable(true).default_size([480.0, 360.0]).min_width(280.0).min_height(160.0).show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(format!("{} 条", self.debug_log.len()));
+                if ui.button("清空").clicked() { self.debug_log.clear(); }
+                if ui.button(if self.debug_follow { "跟随中" } else { "暂停跟随" }).clicked() { self.debug_follow = !self.debug_follow; if !self.debug_follow { self.debug_follow_blocked_until = Some(now + Duration::from_secs(10)); } }
+            });
+            ui.separator();
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                for line in &self.debug_log {
+                    let display = if line.starts_with("🖼") || line.starts_with("🎧") {
+                        line.to_string()
+                    } else {
+                        format!("  {}", line)
+                    };
+                    ui.label(display);
+                }
+                if self.debug_follow {
+                    ui.scroll_to_cursor(Some(egui::Align::BOTTOM));
+                }
+            });
+        });
+        if let Some(window_response) = window_response {
+            let scrolled = ctx.input(|i| i.raw_scroll_delta != egui::Vec2::ZERO);
+            if window_response.response.hovered() && scrolled {
+                if self.debug_follow { self.debug_follow = false; self.debug_follow_blocked_until = Some(now + Duration::from_secs(10)); }
+            }
+        }
     }
 
     fn refresh_model_scripts(&mut self) { self.model_scripts = models::list_model_scripts(); if self.selected_model_script.is_none() || self.selected_model_script.as_ref().is_some_and(|p| !p.exists()) { self.selected_model_script = self.model_scripts.first().cloned(); } self.model_status = format!("发现 {} 个启动文件。", self.model_scripts.len()); }
@@ -698,7 +782,7 @@ impl AiVideoApp {
     fn clean_cache_to_limit(&mut self) { match enforce_cache_size_limit(&default_cache_root(), self.settings.cache_size_limit_mb) { Ok(bytes) => self.show_notice("缓存清理完成", format!("已删除约 {:.2} MB 缓存。", bytes as f64 / 1024.0 / 1024.0)), Err(err) => self.show_notice("缓存清理失败", err.to_string()), } }
 }
 
-impl Drop for AiVideoApp { fn drop(&mut self) { if let Some(cancel) = &self.ai_cancel { cancel.store(true, Ordering::Relaxed); } if let Some(mut child) = self.model_child.take() { models::stop_model_process(&mut child); } } }
+impl Drop for AiVideoApp { fn drop(&mut self) { if let Some(cancel) = &self.ai_cancel { cancel.store(true, Ordering::Relaxed); } if let Some(mut child) = self.model_child.take() { models::stop_model_process(&mut child); } let _ = models::kill_7080_processes(); } }
 
 fn prompt_button(ui: &mut egui::Ui, label: &str, file_name: &str, app: &mut AiVideoApp) { ui.horizontal(|ui| { if ui.button(label).clicked() { match prompts::open_prompt_file(file_name) { Ok(()) => app.show_notice("已打开提示词文档", format!("已打开：{}", prompts::prompt_path(file_name).display())), Err(err) => app.show_notice("打开失败", err), } } ui.small(elide_middle(&prompts::prompt_path(file_name).display().to_string(), 60)); }); }
 fn load_texture_from_path(ctx: &egui::Context, path: &str, key: &str) -> Result<egui::TextureHandle, String> { let image = image::open(Path::new(path)).map_err(|err| err.to_string())?.to_rgba8(); let size = [image.width() as usize, image.height() as usize]; let pixels = image.into_raw(); let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &pixels); Ok(ctx.load_texture(key.to_string(), color_image, egui::TextureOptions::LINEAR)) }
