@@ -2,3 +2,4 @@ pub mod app;
 pub mod commands;
 pub mod components;
 pub mod status;
+pub mod status_panel;
