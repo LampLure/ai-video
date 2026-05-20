@@ -145,10 +145,9 @@ impl eframe::App for AiVideoApp {
                 if p.exists() { let _ = self.pending_folder.lock().map(|mut pf| *pf = Some(p)); }
             }
         }
-        if let Ok(mut pending) = self.pending_folder.lock() {
-            if let Some(folder) = pending.take() {
-                self.open_folder(folder);
-            }
+        let folder_to_open = self.pending_folder.lock().ok().and_then(|mut p| p.take());
+        if let Some(folder) = folder_to_open {
+            self.open_folder(folder);
         }
         apply_gray_theme(ctx);
         self.tick_playback(ctx);

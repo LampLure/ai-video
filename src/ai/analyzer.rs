@@ -6,7 +6,7 @@ use crate::core::cache_manager::{extract_audio_segment, extract_frames};
 use crate::core::settings::AppSettings;
 use crate::core::video_manager::VideoMeta;
 use crate::db::Database;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::path::Path;
 
 pub fn analyze_video(video: &VideoMeta, settings: &AppSettings, db_path: &Path) -> Result<AnalysisResult> {
