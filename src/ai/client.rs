@@ -23,7 +23,7 @@ impl AiClient {
     pub fn new(endpoint: impl Into<String>, model_name: impl Into<String>) -> Self {
         let http = Client::builder()
             .connect_timeout(Duration::from_secs(10))
-            .read_timeout(Duration::from_secs(180))
+            .timeout(Duration::from_secs(180))
             .build()
             .unwrap_or_else(|_| Client::new());
         Self { endpoint: endpoint.into(), model_name: model_name.into(), http }
