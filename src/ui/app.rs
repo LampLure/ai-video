@@ -806,9 +806,10 @@ impl AiVideoApp {
     fn poll_model_process(&mut self) { if let Some(child) = self.model_child.as_mut() { if child.try_wait().ok().flatten().is_some() { self.model_child = None; self.model_status = "模型进程已退出。".to_string(); } } }
     fn poll_model_health(&mut self) { let Some(check) = self.pending_model_check.clone() else { return; }; let ready = models::is_llama_service_ready(Duration::from_millis(300)); match check.kind { ModelCheckKind::Start => { if ready { self.pending_model_check = None; self.model_status = "7080 服务已连接，模型运行正常。".to_string(); self.show_notice("模型启动成功", "已成功连接 127.0.0.1:7080。".to_string()); return; } if Instant::now() >= check.due { self.pending_model_check = None; self.model_status = "10 秒内未能连接 7080，请检查脚本和模型日志。".to_string(); self.show_notice("模型可能未就绪", "启动命令已发送，但 10 秒内无法连接 127.0.0.1:7080。模型可能仍在加载，或脚本启动失败。".to_string()); } } ModelCheckKind::Stop => { if Instant::now() < check.due { return; } self.pending_model_check = None; if ready { self.model_status = "7080 仍可连接，可再次点击终止。".to_string(); self.show_notice("7080 仍可连接", "强制终止后 7080 仍可连接。可以再次点击“终止”。".to_string()); } else { self.model_status = "7080 已释放。".to_string(); self.show_notice("7080 已释放", "检测到 127.0.0.1:7080 已不可连接。".to_string()); } } } }
     fn has_pending_model_check(&self, kind: ModelCheckKind) -> bool { self.pending_model_check.as_ref().map(|check| check.kind == kind).unwrap_or(false) }
-    fn show_notice(&mut self, title: &str, body: String) {
-        self.model_notice_title = title.to_string();
+    fn show_notice(&mut self, _title: &str, body: String) {
         self.model_notice_body = body;
+        self.model_notice_open = false;
+        self.model_notice_dismiss_at = None;
         self.model_notice_open = true;
         self.model_notice_dismiss_at = Some(Instant::now() + Duration::from_secs(5));
     }
@@ -819,9 +820,8 @@ impl AiVideoApp {
             ctx.request_repaint_after(Duration::from_millis(500));
         }
         let mut open = self.model_notice_open;
-        let title = self.model_notice_title.clone();
         let body = self.model_notice_body.clone();
-        egui::Window::new(&title).collapsible(false).resizable(true).default_width(380.0).open(&mut open).show(ctx, |ui| {
+        egui::Window::new("通知").collapsible(false).resizable(false).auto_sized().open(&mut open).show(ctx, |ui| {
             ui.label(&body);
         });
         if !open { self.model_notice_open = false; }
