@@ -10,6 +10,15 @@ use anyhow::{Context, Result};
 use std::path::Path;
 
 pub fn analyze_video(video: &VideoMeta, settings: &AppSettings, db_path: &Path) -> Result<AnalysisResult> {
+    analyze_video_with_events(video, settings, db_path, |_| {}, |_| {})
+}
+
+pub fn analyze_video_with_events<S, D>(video: &VideoMeta, settings: &AppSettings, db_path: &Path, mut on_status: S, mut on_delta: D) -> Result<AnalysisResult>
+where
+    S: FnMut(&str) + Send,
+    D: FnMut(&str) + Send,
+{
+    on_status("program extracting video frames");
     let frame_times = uniform_timestamps(video.duration, settings.max_images);
     let audio_centers = uniform_timestamps(video.duration, settings.max_audio_segments);
     let frames = extract_frames(&video.path, &video.hash, &frame_times, settings.image_pixel_limit)?;
@@ -27,52 +36,75 @@ pub fn analyze_video(video: &VideoMeta, settings: &AppSettings, db_path: &Path) 
     prompt.push_str("\n\n# 输出格式约束\n");
     prompt.push_str(&read_prompt(RESPONSE_SCHEMA_PROMPT));
 
+    on_status("program sending multimodal request to AI");
     let client = AiClient::new(settings.llama_cpp_endpoint.clone(), settings.model_name.clone());
-    let raw = client.chat_multimodal("", &prompt, &frames, &audio, 0.1)?;
+    let raw = client.chat_multimodal_with_callback("", &prompt, &frames, &audio, 0.1, |delta| on_delta(delta))?;
+    on_status("AI response received, parsing JSON");
     let result = parse_analysis_result(&raw)?;
 
     let db = Database::open(db_path)?;
     let video_id = db.upsert_video(video)?;
     db.save_summary(video_id, &result, &settings.model_name)?;
+    on_status("summary saved to database");
     Ok(result)
 }
 
 pub fn ask_video_question(video: &VideoMeta, question: &str, settings: &AppSettings) -> Result<String> {
+    ask_video_question_with_events(video, question, settings, |_| {}, |_| {})
+}
+
+pub fn ask_video_question_with_events<S, D>(video: &VideoMeta, question: &str, settings: &AppSettings, mut on_status: S, mut on_delta: D) -> Result<String>
+where
+    S: FnMut(&str) + Send,
+    D: FnMut(&str) + Send,
+{
     let client = AiClient::new(settings.llama_cpp_endpoint.clone(), settings.model_name.clone());
     let first_prompt = format!(
         "{}\n\n# 当前视频\n视频名：{}\n视频路径：{}\n视频 hash：{}\n视频时长：{:.3}s\n最大图片数：{}\n最大音频段数：{}\n用户问题：{}",
         read_prompt(VIDEO_QA_AGENT_PROMPT), video.name, video.path, video.hash, video.duration, settings.max_images, settings.max_audio_segments, question
     );
-    let first = client.chat_streaming(vec![ChatMessage { role: "user".to_string(), content: first_prompt.clone() }], 0.2)?;
+    on_status("AI received user question");
+    on_status("program sent video metadata and limits to AI");
+    let first = client.chat_streaming_with_callback(vec![ChatMessage { role: "user".to_string(), content: first_prompt.clone() }], 0.2, |_| {})?;
 
     if let Ok(request) = serde_json::from_str::<AgentRequest>(&clean_model_output(&first)) {
+        on_status("AI requested video evidence from program");
         let limits = SegmentRequestLimits::from_settings(video.duration, settings);
         let response = handle_agent_request(request, limits, settings)?;
         match response {
             AgentResponse::Ok { frames, audio } => {
+                on_status("program prepared requested video evidence");
                 let evidence_prompt = format!(
                     "用户问题：{}\n\n程序已按你的 JSON 请求准备证据。请只根据这些证据和视频元数据回答。\n视频名：{}\n视频时长：{:.3}s\n请用中文简洁回答。如果证据不足，直接说明不足。",
                     question, video.name, video.duration
                 );
-                return client.chat_multimodal("", &evidence_prompt, &frames, &audio, 0.2);
+                on_status("program sent evidence to AI");
+                let answer = client.chat_multimodal_with_callback("", &evidence_prompt, &frames, &audio, 0.2, |delta| on_delta(delta))?;
+                on_status("AI answer complete");
+                return Ok(answer);
             }
             AgentResponse::Error { code, message } => {
+                on_status("program rejected AI evidence request");
                 let repair_prompt = format!(
                     "你的上一条片段请求被程序拒绝。错误代码：{}。错误信息：{}。请在限制范围内重新请求更少数据，或者直接说明无法回答。用户问题：{}",
                     code, message, question
                 );
-                return client.chat_streaming(
+                let answer = client.chat_streaming_with_callback(
                     vec![
                         ChatMessage { role: "user".to_string(), content: first_prompt },
                         ChatMessage { role: "assistant".to_string(), content: first },
                         ChatMessage { role: "user".to_string(), content: repair_prompt },
                     ],
                     0.2,
-                );
+                    |delta| on_delta(delta),
+                )?;
+                on_status("AI answer complete");
+                return Ok(answer);
             }
         }
     }
 
+    on_status("AI answered without requesting program evidence");
     Ok(first)
 }
 
