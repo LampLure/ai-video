@@ -279,6 +279,7 @@ impl AiVideoApp {
     }
 
     fn overview_video_card(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, idx: usize, size: egui::Vec2) {
+        self.hydrate_video_maybe(idx);
         let selected = self.selected_index == Some(idx);
         let video = self.videos[idx].clone();
         let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
@@ -505,6 +506,7 @@ impl AiVideoApp {
     }
 
     fn side_video_card(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, idx: usize) {
+        self.hydrate_video_maybe(idx);
         let selected = self.selected_index == Some(idx);
         let video = self.videos[idx].clone();
         let size = egui::vec2(ui.available_width().max(90.0), 130.0);
@@ -553,10 +555,15 @@ impl AiVideoApp {
     }
 
     fn settings_nav_button(&mut self, ui: &mut egui::Ui, section: SettingsSection, label: &str) { if ui.add_sized([ui.available_width(), 28.0], egui::SelectableLabel::new(self.settings_section == section, label)).clicked() { self.settings_section = section; } }
+    fn hydrate_video_maybe(&mut self, idx: usize) {
+        if idx >= self.videos.len() { return; }
+        if self.videos[idx].duration > 0.0 { return; }
+        if let Ok(h) = hydrate_video_meta(&self.videos[idx]) { self.videos[idx] = h; }
+    }
     fn filtered_video_indices(&self) -> Vec<usize> { let q = self.search_query.trim().to_ascii_lowercase(); self.videos.iter().enumerate().filter_map(|(idx, video)| if q.is_empty() || video.name.to_ascii_lowercase().contains(&q) { Some(idx) } else { None }).collect() }
     fn current_video(&self) -> Option<&VideoMeta> { self.selected_index.and_then(|idx| self.videos.get(idx)) }
 
-    fn select_video(&mut self, idx: usize) { self.selected_index = Some(idx); self.playback_position = 0.0; self.playback_playing = false; self.playback_last_tick = None; }
+    fn select_video(&mut self, idx: usize) { self.hydrate_video_maybe(idx); self.selected_index = Some(idx); self.playback_position = 0.0; self.playback_playing = false; self.playback_last_tick = None; }
     fn switch_mode(&mut self, mode: ScreenMode) { self.mode = mode; if self.mode == ScreenMode::Overview { self.bottom_panel_height = self.bottom_panel_height.min(120.0).max(64.0); } else if matches!(self.mode, ScreenMode::Playback | ScreenMode::AiAnalysis) && self.bottom_panel_height < 180.0 { self.bottom_panel_height = 240.0; } }
 
     fn open_folder(&mut self, folder: PathBuf) {
