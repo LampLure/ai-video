@@ -52,8 +52,15 @@ pub fn handle_agent_request(req: AgentRequest, limits: SegmentRequestLimits, set
             if frame_times.iter().chain(audio_centers.iter()).any(|v| *v < 0.0 || *v > limits.duration) {
                 return Ok(AgentResponse::Error { code: "timestamp_out_of_range".into(), message: format!("timestamp must be between 0 and {:.3}", limits.duration) });
             }
-            if settings.audio_clip_seconds <= 0.0 {
-                return Ok(AgentResponse::Error { code: "invalid_audio_clip_length".into(), message: "audio_clip_seconds must be greater than 0".into() });
+            if audio_centers.len() == 1 && limits.duration > limits.audio_clip_seconds as f64 * 2.0 {
+                return Ok(AgentResponse::Error {
+                    code: "audio_request_too_broad".into(),
+                    message: format!(
+                        "audio must use centered clips. Request more audio_centers for wider coverage. Each clip is {:.1}s and at most {} clips are allowed.",
+                        limits.audio_clip_seconds,
+                        limits.max_audio_segments
+                    ),
+                });
             }
             let frames = extract_frames(&video_path, &video_hash, &frame_times, settings.image_pixel_limit)?;
             let mut audio = Vec::new();
@@ -67,7 +74,7 @@ pub fn handle_agent_request(req: AgentRequest, limits: SegmentRequestLimits, set
 
 pub fn build_initial_constraints_message(duration: f64, settings: &AppSettings) -> String {
     format!(
-        "Video total duration: {duration:.3}s. Limits: max_images={}, max_audio_segments={}, audio_clip_seconds={}s, image_pixel_limit={}, max_context_tokens={}. Audio requests must use audio_centers. Each center creates one mono WAV clip near that timestamp, and the clip length is capped by audio_clip_seconds. Do not cover the full media timeline with a single audio request. You may request at most max_audio_segments audio clips per turn. Use only the standard JSON agent request format for additional data.",
+        "Video total duration: {duration:.3}s. Limits: max_images={}, max_audio_segments={}, audio_clip_seconds={}, image_pixel_limit={}, max_context_tokens={}. Audio must be requested as centered clips through audio_centers. Each clip is audio_clip_seconds seconds long and at most max_audio_segments clips are allowed.",
         settings.max_images,
         settings.max_audio_segments,
         settings.audio_clip_seconds,
