@@ -412,7 +412,15 @@ impl AiVideoApp {
     }
 
     fn bottom_chat(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| { ui.heading("AI 对话"); ui.separator(); let prompt_state = if self.ai_running { "后台分析中：输入禁用" } else if self.qa_running { "问答请求中" } else { "可提问当前视频" }; ui.label(prompt_state); });
+        ui.horizontal(|ui| {
+            ui.heading("AI 对话");
+            ui.separator();
+            let prompt_state = if self.ai_running { "后台分析中：输入禁用" } else if self.qa_running { "问答请求中" } else { "可提问当前视频" };
+            ui.label(prompt_state);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("刷新对话").clicked() { self.reset_ai_chat(); }
+            });
+        });
         let log_height = (ui.available_height() - 34.0).max(50.0);
         egui::ScrollArea::vertical().max_height(log_height).auto_shrink([false, false]).show(ui, |ui| {
             let keep_from = self.chat_log.len().saturating_sub(80);
@@ -540,6 +548,14 @@ impl AiVideoApp {
     fn persist_scanned_videos(&mut self) { if let Ok(db) = Database::open(&self.db_path) { for video in &self.videos { let _ = db.upsert_video(video); } } }
     fn search_current_database(&mut self) { match Database::open(&self.db_path).and_then(|db| db.search(&self.search_query, 50)) { Ok(results) => self.search_results = results, Err(err) => self.chat_log.push(format!("搜索失败：{err}")), } }
     fn generate_visible_thumbnails(&mut self) { self.chat_log.push("系统：缩略图已改为懒加载。滚动到哪里就生成哪里附近的缩略图。".to_string()); }
+
+    fn reset_ai_chat(&mut self) {
+        self.user_question.clear();
+        self.qa_rx = None;
+        self.qa_running = false;
+        self.chat_log.clear();
+        self.chat_log.push("系统：AI 对话已刷新，已打开全新上下文。".to_string());
+    }
 
     fn start_analysis_queue(&mut self) {
         if self.ai_running { return; }
